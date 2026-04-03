@@ -1,0 +1,68 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import {
+  configDeclaresProvider,
+  listConfiguredProviderIds,
+  readCurrentProviderFromConfigText,
+  setRootProviderInConfigText
+} from "../src/config-file.js";
+
+test("readCurrentProviderFromConfigText falls back to implicit openai", () => {
+  const input = `
+# comment
+sandbox_mode = "danger-full-access"
+
+[features]
+apps = true
+`;
+
+  assert.deepEqual(readCurrentProviderFromConfigText(input), {
+    provider: "openai",
+    implicit: true
+  });
+});
+
+test("setRootProviderInConfigText inserts root-level model_provider before first table", () => {
+  const input = `# comment
+sandbox_mode = "danger-full-access"
+
+[features]
+apps = true
+`;
+
+  const next = setRootProviderInConfigText(input, "apigather");
+  assert.match(next, /^# comment\nsandbox_mode = "danger-full-access"\n\nmodel_provider = "apigather"\n\[features]/);
+});
+
+test("setRootProviderInConfigText updates existing root-level model_provider", () => {
+  const input = `model_provider = "openai"\nsandbox_mode = "danger-full-access"\n`;
+  const next = setRootProviderInConfigText(input, "newapi");
+  assert.equal(next, `model_provider = "newapi"\nsandbox_mode = "danger-full-access"\n`);
+});
+
+test("setRootProviderInConfigText preserves CRLF line endings", () => {
+  const input = `model_provider = "openai"\r\nsandbox_mode = "danger-full-access"\r\n`;
+  const next = setRootProviderInConfigText(input, "newapi");
+  assert.equal(next, `model_provider = "newapi"\r\nsandbox_mode = "danger-full-access"\r\n`);
+});
+
+test("setRootProviderInConfigText preserves trailing blank lines", () => {
+  const input = `model_provider = "openai"\n\n`;
+  const next = setRootProviderInConfigText(input, "newapi");
+  assert.equal(next, `model_provider = "newapi"\n\n`);
+});
+
+test("provider declarations include openai and custom tables", () => {
+  const input = `
+[model_providers.apigather]
+base_url = "https://example.com"
+
+[model_providers.newapi]
+base_url = "https://example.org"
+`;
+
+  assert.deepEqual(listConfiguredProviderIds(input), ["apigather", "newapi", "openai"]);
+  assert.equal(configDeclaresProvider(input, "apigather"), true);
+  assert.equal(configDeclaresProvider(input, "missing"), false);
+});
