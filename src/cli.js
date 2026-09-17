@@ -8,7 +8,7 @@ import {
   getCurrentAccount,
   listAccounts,
   removeAccount,
-  saveAccount,
+  addAccount,
   syncActiveAccountFromCurrentAuth,
   useAccount
 } from "./auth-service.js";
@@ -25,7 +25,7 @@ Usage:
   cx status
   cx switch <email|alias>
 
-  cx save [alias]
+  cx add [alias]
   cx list
   cx remove <email|alias>
 `);
@@ -41,12 +41,12 @@ function parseArgs(argv) {
       positionals.push(value);
       continue;
     }
-    const [flagName, inlineValue] = value.split("=", 2);
-    const normalizedName = flagName.slice(2);
-    if (inlineValue !== undefined) {
-      flags[normalizedName] = inlineValue;
+    const eqIndex = value.indexOf("=");
+    if (eqIndex !== -1) {
+      flags[value.slice(2, eqIndex)] = value.slice(eqIndex + 1);
       continue;
     }
+    const normalizedName = value.slice(2);
     const nextValue = argv[index + 1];
     if (nextValue && !nextValue.startsWith("--")) {
       flags[normalizedName] = nextValue;
@@ -70,10 +70,9 @@ function validateFlags(command, flags) {
   const allowedFlagsByCommand = {
     status: new Set(),
     switch: new Set(["account"]),
-    save: new Set(["alias"]),
+    add: new Set(["alias"]),
     list: new Set(),
-    remove: new Set(["account"]),
-    usage: new Set()
+    remove: new Set(["account"])
   };
 
   const allowedFlags = allowedFlagsByCommand[command];
@@ -113,6 +112,20 @@ function accountLabel(account) {
   return `${primary}${providerSuffix}`;
 }
 
+function renderRegisteredAccounts(accounts, activeKey) {
+  const labelOf = (account) => account.email ?? account.alias ?? account.account_key;
+  const labelWidth = Math.max(...accounts.map((account) => labelOf(account).length), 0);
+
+  const lines = [`Registered accounts (${accounts.length}):`];
+  for (const account of accounts) {
+    const isActive = account.account_key === activeKey;
+    const provider = account.provider ?? "-";
+    lines.push(`${isActive ? "*" : " "} ${labelOf(account).padEnd(labelWidth)}  ${provider}${isActive ? "  (active)" : ""}`);
+  }
+
+  return lines.join("\n");
+}
+
 async function resolveAccountIdentifier(codexHome, identifier, action) {
   if (!identifier) {
     return identifier;
@@ -125,7 +138,7 @@ async function resolveAccountIdentifier(codexHome, identifier, action) {
   }
 
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
-    throw new Error(`Multiple saved accounts match "${identifier}". Re-run in a TTY to choose one.`);
+    throw new Error(`Multiple registered accounts match "${identifier}". Re-run in a TTY to choose one.`);
   }
 
   const rl = createInterface({
@@ -166,10 +179,6 @@ async function resolveAccountIdentifier(codexHome, identifier, action) {
 
 async function loadServiceModule() {
   return import("./service.js");
-}
-
-async function loadUsageModule() {
-  return import("./usage-service.js");
 }
 
 async function main() {
@@ -225,26 +234,24 @@ async function main() {
     return;
   }
 
-  if (command === "save") {
-    assertNoExtraPositionals(positionals, 2, "cx save [alias]");
+  if (command === "add") {
+    assertNoExtraPositionals(positionals, 2, "cx add [alias]");
     const alias = positionals[1] ?? flags.alias;
-    const result = await saveAccount(resolveHome(), alias);
-    console.log(`Saved account: ${result.email ?? result.accountKey}${result.alias ? ` (alias: ${result.alias})` : ""}`);
+    const result = await addAccount(resolveHome(), alias);
+    console.log(`Added account: ${result.email ?? result.accountKey}${result.alias ? ` (alias: ${result.alias})` : ""}`);
     return;
   }
 
   if (command === "list") {
     assertNoExtraPositionals(positionals, 1, "cx list");
     await syncActiveAccountFromCurrentAuth(resolveHome());
-    const { renderAccountsTable, refreshChatgptUsageFromApi } = await loadUsageModule();
-    await refreshChatgptUsageFromApi(resolveHome());
     const accounts = await listAccounts(resolveHome());
-    const current = await getCurrentAccount(resolveHome());
     if (!accounts.length) {
-      console.log("No saved accounts. Run `cx save` first.");
+      console.log("No registered accounts. Run `cx add` first.");
       return;
     }
-    console.log(renderAccountsTable(accounts, current?.account_key ?? null));
+    const current = await getCurrentAccount(resolveHome());
+    console.log(renderRegisteredAccounts(accounts, current?.account_key ?? null));
     return;
   }
 
@@ -254,15 +261,6 @@ async function main() {
     const identifier = await resolveAccountIdentifier(resolveHome(), positionals[1] ?? flags.account, "remove");
     const result = await removeAccount(resolveHome(), identifier);
     console.log(`Removed account: ${result.email ?? result.accountKey}`);
-    return;
-  }
-
-  if (command === "usage") {
-    assertNoExtraPositionals(positionals, 1, "cx usage");
-    await syncActiveAccountFromCurrentAuth(resolveHome());
-    const { formatUsage, loadUsageDisplayState } = await loadUsageModule();
-    const usageState = await loadUsageDisplayState(resolveHome());
-    console.log(formatUsage(usageState));
     return;
   }
 

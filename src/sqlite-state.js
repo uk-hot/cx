@@ -95,19 +95,11 @@ export async function assertSqliteWritable(codexHome, options = {}) {
   }
 }
 
-export async function updateSqliteProvider(codexHome, targetProvider, afterUpdateOrOptions, maybeOptions) {
-  const afterUpdate = typeof afterUpdateOrOptions === "function" ? afterUpdateOrOptions : null;
-  const options = typeof afterUpdateOrOptions === "function"
-    ? (maybeOptions ?? {})
-    : (afterUpdateOrOptions ?? {});
-
+export async function updateSqliteProvider(codexHome, targetProvider, options = {}) {
   const dbPath = stateDbPath(codexHome);
   try {
     await fs.access(dbPath);
   } catch {
-    if (afterUpdate) {
-      await afterUpdate({ updatedRows: 0, databasePresent: false });
-    }
     return { updatedRows: 0, databasePresent: false };
   }
 
@@ -123,12 +115,6 @@ export async function updateSqliteProvider(codexHome, targetProvider, afterUpdat
       WHERE COALESCE(model_provider, '') <> ?
     `);
     const result = stmt.run(targetProvider, targetProvider);
-    if (afterUpdate) {
-      await afterUpdate({
-        updatedRows: result.changes ?? 0,
-        databasePresent: true
-      });
-    }
     db.exec("COMMIT");
     transactionOpen = false;
     return { updatedRows: result.changes ?? 0, databasePresent: true };

@@ -137,7 +137,10 @@ export async function getStatus({ codexHome: explicitCodexHome } = {}) {
   const configPath = path.join(codexHome, "config.toml");
   const configText = await readConfigText(configPath);
   const current = readCurrentProviderFromConfigText(configText);
-  const { providerCounts } = await collectSessionChanges(codexHome, "__status_only__");
+  const { providerCounts } = await collectSessionChanges(codexHome, null, {
+    statusOnly: true,
+    skipLockedReads: true
+  });
   const sqliteCounts = await readSqliteProviderCounts(codexHome);
 
   return {
@@ -196,6 +199,95 @@ export function renderStatus(status) {
   ].join("\n");
 }
 
+async function restoreAppliedOrThrow(appliedChanges, causeError) {
+  if (!appliedChanges.length) {
+    return;
+  }
+  try {
+    await restoreSessionChanges(appliedChanges.map((change) => ({
+      path: change.path,
+      originalFirstLine: change.originalFirstLine,
+      originalSeparator: change.originalSeparator
+    })));
+  } catch (restoreError) {
+    throw new Error(
+      `Failed to restore rollout files after sync error. Original error: ${causeError.message}. Restore error: ${restoreError.message}`
+    );
+  }
+}
+
+async function runSyncLocked({
+  codexHome,
+  provider,
+  sqliteBusyTimeoutMs
+}) {
+  const configPath = path.join(codexHome, "config.toml");
+  const configText = await readConfigText(configPath);
+  const current = readCurrentProviderFromConfigText(configText);
+  const targetProvider = provider ?? current.provider ?? DEFAULT_PROVIDER;
+
+  const {
+    changes,
+    lockedPaths: lockedReadPaths,
+    providerCounts
+  } = await collectSessionChanges(codexHome, targetProvider, { skipLockedReads: true });
+  const {
+    writableChanges,
+    lockedChanges
+  } = await splitLockedSessionChanges(changes);
+  const skippedRolloutFiles = [...new Set([
+    ...lockedReadPaths,
+    ...lockedChanges.map((change) => change.path)
+  ])].sort((left, right) => left.localeCompare(right));
+
+  // Verify the database is writable before rewriting any rollout file, so we
+  // do not touch files only to discover the database is locked afterwards.
+  await assertSqliteWritable(codexHome, { busyTimeoutMs: sqliteBusyTimeoutMs });
+
+  // 1) Rewrite rollout files first, outside of any SQLite transaction, so the
+  //    database write lock (step 2) stays short regardless of file count.
+  let applyResult;
+  try {
+    applyResult = await applySessionChanges(writableChanges);
+  } catch (error) {
+    const appliedPathSet = new Set(error.appliedPaths ?? []);
+    await restoreAppliedOrThrow(
+      writableChanges.filter((change) => appliedPathSet.has(change.path)),
+      error
+    );
+    throw error;
+  }
+  const appliedPathSet = new Set(applyResult.appliedPaths);
+  const appliedSessionChanges = writableChanges.filter((change) => appliedPathSet.has(change.path));
+
+  // 2) Update SQLite in a short transaction. On failure, roll the rewritten
+  //    rollout files back so both stores stay consistent.
+  let sqliteResult;
+  try {
+    sqliteResult = await updateSqliteProvider(codexHome, targetProvider, {
+      busyTimeoutMs: sqliteBusyTimeoutMs
+    });
+  } catch (error) {
+    await restoreAppliedOrThrow(appliedSessionChanges, error);
+    throw error;
+  }
+
+  const skippedLockedRolloutFiles = [...new Set([
+    ...skippedRolloutFiles,
+    ...applyResult.skippedPaths
+  ])].sort((left, right) => left.localeCompare(right));
+  return {
+    codexHome,
+    targetProvider,
+    previousProvider: current.provider,
+    changedSessionFiles: applyResult.appliedChanges,
+    skippedLockedRolloutFiles,
+    sqliteRowsUpdated: sqliteResult.updatedRows,
+    sqlitePresent: sqliteResult.databasePresent,
+    rolloutCountsBefore: summarizeProviderCounts(providerCounts)
+  };
+}
+
 export async function runSync({
   codexHome: explicitCodexHome,
   provider,
@@ -203,76 +295,10 @@ export async function runSync({
 } = {}) {
   const codexHome = normalizeCodexHome(explicitCodexHome);
   await ensureCodexHome(codexHome);
-  const configPath = path.join(codexHome, "config.toml");
-  const configText = await readConfigText(configPath);
-  const current = readCurrentProviderFromConfigText(configText);
-  const targetProvider = provider ?? current.provider ?? DEFAULT_PROVIDER;
 
   const releaseLock = await acquireLock(codexHome, "sync");
   try {
-    const {
-      changes,
-      lockedPaths: lockedReadPaths,
-      providerCounts
-    } = await collectSessionChanges(codexHome, targetProvider, { skipLockedReads: true });
-    const {
-      writableChanges,
-      lockedChanges
-    } = await splitLockedSessionChanges(changes);
-    const skippedRolloutFiles = [...new Set([
-      ...lockedReadPaths,
-      ...lockedChanges.map((change) => change.path)
-    ])].sort((left, right) => left.localeCompare(right));
-    await assertSqliteWritable(codexHome, { busyTimeoutMs: sqliteBusyTimeoutMs });
-
-    let sessionRestoreNeeded = false;
-    let appliedSessionChanges = [];
-    try {
-      let applyResult = { appliedChanges: 0, appliedPaths: [], skippedPaths: [] };
-      const sqliteResult = await updateSqliteProvider(
-        codexHome,
-        targetProvider,
-        async () => {
-          if (writableChanges.length === 0) {
-            return;
-          }
-          applyResult = await applySessionChanges(writableChanges);
-          const appliedPathSet = new Set(applyResult.appliedPaths ?? []);
-          appliedSessionChanges = writableChanges.filter((change) => appliedPathSet.has(change.path));
-          sessionRestoreNeeded = appliedSessionChanges.length > 0;
-        },
-        { busyTimeoutMs: sqliteBusyTimeoutMs }
-      );
-      const skippedLockedRolloutFiles = [...new Set([
-        ...skippedRolloutFiles,
-        ...applyResult.skippedPaths
-      ])].sort((left, right) => left.localeCompare(right));
-      return {
-        codexHome,
-        targetProvider,
-        previousProvider: current.provider,
-        changedSessionFiles: applyResult.appliedChanges,
-        skippedLockedRolloutFiles,
-        sqliteRowsUpdated: sqliteResult.updatedRows,
-        sqlitePresent: sqliteResult.databasePresent,
-        rolloutCountsBefore: summarizeProviderCounts(providerCounts)
-      };
-    } catch (error) {
-      if (sessionRestoreNeeded) {
-        try {
-          await restoreSessionChanges(appliedSessionChanges.map((change) => ({
-            path: change.path,
-            originalFirstLine: change.originalFirstLine,
-            originalSeparator: change.originalSeparator
-          })));
-        } catch (restoreError) {
-          throw new Error(
-            `Failed to restore rollout files after sync error. Original error: ${error.message}. Restore error: ${restoreError.message}`
-          );
-        }
-      }
-      throw error;
-    }
+    return await runSyncLocked({ codexHome, provider, sqliteBusyTimeoutMs });
   } finally {
     await releaseLock();
   }
@@ -293,36 +319,41 @@ export async function runSwitch({
   const codexHome = normalizeCodexHome(explicitCodexHome);
   await ensureCodexHome(codexHome);
 
-  const configPath = path.join(codexHome, "config.toml");
-  const authPath = path.join(codexHome, AUTH_FILE_NAME);
-  const registryPath = path.join(codexHome, ACCOUNTS_DIR_NAME, REGISTRY_FILE_NAME);
-  const snapshots = await Promise.all([
-    readTextFileSnapshot(configPath),
-    readTextFileSnapshot(authPath),
-    readTextFileSnapshot(registryPath)
-  ]);
-
+  const releaseLock = await acquireLock(codexHome, "switch");
   try {
-    const useResult = await useAccountFn(codexHome, identifier);
-    const newConfigText = await readConfigText(configPath);
-    const { provider: newProvider } = readCurrentProviderFromConfigText(newConfigText);
+    const configPath = path.join(codexHome, "config.toml");
+    const authPath = path.join(codexHome, AUTH_FILE_NAME);
+    const registryPath = path.join(codexHome, ACCOUNTS_DIR_NAME, REGISTRY_FILE_NAME);
+    const snapshots = await Promise.all([
+      readTextFileSnapshot(configPath),
+      readTextFileSnapshot(authPath),
+      readTextFileSnapshot(registryPath)
+    ]);
 
-    const syncResult = await runSync({
-      codexHome,
-      provider: newProvider
-    });
-    return {
-      ...syncResult,
-      configUpdated: true,
-      switchedAccount: useResult
-    };
-  } catch (error) {
-    const restoreFailures = await restoreTextFileSnapshots(snapshots);
-    if (restoreFailures.length > 0) {
-      throw new Error(
-        `Failed to restore switch state after sync error. Original error: ${error.message}. Restore error(s): ${formatRestoreFailures(restoreFailures)}`
-      );
+    try {
+      const useResult = await useAccountFn(codexHome, identifier);
+      const newConfigText = await readConfigText(configPath);
+      const { provider: newProvider } = readCurrentProviderFromConfigText(newConfigText);
+
+      const syncResult = await runSyncLocked({
+        codexHome,
+        provider: newProvider
+      });
+      return {
+        ...syncResult,
+        configUpdated: true,
+        switchedAccount: useResult
+      };
+    } catch (error) {
+      const restoreFailures = await restoreTextFileSnapshots(snapshots);
+      if (restoreFailures.length > 0) {
+        throw new Error(
+          `Failed to restore switch state after sync error. Original error: ${error.message}. Restore error(s): ${formatRestoreFailures(restoreFailures)}`
+        );
+      }
+      throw error;
     }
-    throw error;
+  } finally {
+    await releaseLock();
   }
 }

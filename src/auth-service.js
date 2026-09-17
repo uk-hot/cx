@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -143,6 +144,48 @@ async function fileExists(filePath) {
   }
 }
 
+async function writeFileAtomically(filePath, text) {
+  const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(temporaryPath, text, { encoding: "utf8", mode: 0o600 });
+    await fs.rename(temporaryPath, filePath);
+  } catch (error) {
+    await fs.rm(temporaryPath, { force: true }).catch(() => {});
+    throw error;
+  }
+}
+
+async function persistCurrentOAuthSnapshot(codexHome, registry) {
+  const authPath = resolveAuthPath(codexHome);
+  let authText;
+  let parsed;
+
+  try {
+    authText = await fs.readFile(authPath, "utf8");
+    parsed = parseAuthFile(JSON.parse(authText));
+  } catch {
+    return false;
+  }
+
+  if (!parsed?.accountKey) {
+    return false;
+  }
+
+  const currentAccount = registry.accounts.find(
+    (account) => account.account_key === parsed.accountKey
+  );
+  if (!currentAccount) {
+    return false;
+  }
+
+  const snapshotPath = path.join(
+    resolveAccountsDir(codexHome),
+    accountKeyToFilename(currentAccount.account_key)
+  );
+  await writeFileAtomically(snapshotPath, authText);
+  return true;
+}
+
 async function readProviderFromConfig(codexHome) {
   const configPath = resolveConfigPath(codexHome);
   try {
@@ -247,7 +290,7 @@ export async function syncActiveAccountFromCurrentAuth(codexHome) {
   return true;
 }
 
-export async function saveAccount(codexHome, alias) {
+export async function addAccount(codexHome, alias) {
   const accountsDir = resolveAccountsDir(codexHome);
   await fs.mkdir(accountsDir, { recursive: true });
 
@@ -258,7 +301,7 @@ export async function saveAccount(codexHome, alias) {
   const configExists = await fileExists(configPath);
 
   if (!authExists && !configExists) {
-    throw new Error(`Neither auth.json nor config.toml found in ${codexHome}. Nothing to save.`);
+    throw new Error(`Neither auth.json nor config.toml found in ${codexHome}. Nothing to add.`);
   }
 
   let parsed = null;
@@ -282,7 +325,7 @@ export async function saveAccount(codexHome, alias) {
     authMode = parsed.authMode;
   } else {
     if (!alias) {
-      throw new Error("Cannot auto-detect account identity. Provide an alias: cx save <alias>");
+      throw new Error("Cannot auto-detect account identity. Provide an alias: cx add <alias>");
     }
     accountKey = `manual::${alias}`;
   }
@@ -336,10 +379,8 @@ export async function saveAccount(codexHome, alias) {
     registry.accounts.push(accountEntry);
   }
 
-  if (!registry.active_account_key) {
-    registry.active_account_key = accountKey;
-    registry.active_account_activated_at_ms = Date.now();
-  }
+  registry.active_account_key = accountKey;
+  registry.active_account_activated_at_ms = Date.now();
   await writeRegistry(codexHome, registry);
 
   return { accountKey, email, alias: accountEntry.alias, provider };
@@ -355,10 +396,10 @@ export async function useAccount(codexHome, identifier) {
   const match = matches[0];
 
   if (!match) {
-    throw new Error(`No saved account matches "${identifier}".`);
+    throw new Error(`No registered account matches "${identifier}".`);
   }
   if (matches.length > 1) {
-    throw new Error(`Multiple saved accounts match "${identifier}".`);
+    throw new Error(`Multiple registered accounts match "${identifier}".`);
   }
 
   const accountsDir = resolveAccountsDir(codexHome);
@@ -370,15 +411,20 @@ export async function useAccount(codexHome, identifier) {
   const hasConfigSnapshot = await fileExists(configSnapshotPath);
 
   if (!hasAuthSnapshot && !hasConfigSnapshot) {
-    throw new Error(`No snapshot files found for "${match.email ?? match.alias ?? match.account_key}". Re-save the account.`);
+    throw new Error(`No snapshot files found for "${match.email ?? match.alias ?? match.account_key}". Re-add the account.`);
   }
+
+  // Codex refreshes OAuth tokens in auth.json while it is running. Preserve
+  // that latest credential set before replacing auth.json with another
+  // account, otherwise a later switch restores the stale tokens captured by the
+  // original `cx add`.
+  await persistCurrentOAuthSnapshot(codexHome, registry);
 
   const authPath = resolveAuthPath(codexHome);
   const configPath = resolveConfigPath(codexHome);
 
   if (hasAuthSnapshot) {
-    await fs.rm(authPath, { force: true });
-    await fs.copyFile(authSnapshotPath, authPath);
+    await writeFileAtomically(authPath, await fs.readFile(authSnapshotPath, "utf8"));
   } else {
     await fs.rm(authPath, { force: true });
   }
@@ -410,10 +456,10 @@ export async function removeAccount(codexHome, identifier) {
   const match = matches[0];
 
   if (!match) {
-    throw new Error(`No saved account matches "${identifier}".`);
+    throw new Error(`No registered account matches "${identifier}".`);
   }
   if (matches.length > 1) {
-    throw new Error(`Multiple saved accounts match "${identifier}".`);
+    throw new Error(`Multiple registered accounts match "${identifier}".`);
   }
 
   const index = registry.accounts.findIndex((account) => account.account_key === match.account_key);

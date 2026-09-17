@@ -1,13 +1,13 @@
 {
   "name": "@uk-hot/cx",
-  "version": "0.2.0",
+  "version": "0.2.6",
   "description": "Synchronize Codex session provider metadata across rollout files and SQLite state.",
   "type": "module",
   "files": [
     "src"
   ],
   "bin": {
-    "cx": "./src/cli.js"
+    "cx": "src/cli.js"
   },
   "scripts": {
     "test": "node --test"

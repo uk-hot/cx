@@ -108,190 +108,7 @@ function parseSessionMetaRecord(firstLine) {
   }
 }
 
-async function invokeWindowsExclusiveRewrite(change, { requireOriginalMatch }) {
-  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-provider-rewrite-"));
-  const manifestPath = path.join(tempDir, "change.json");
-  const script = `
-& {
-  param([string]$manifestPath)
-
-  function Read-FirstLineRecord([System.IO.FileStream]$stream) {
-    $stream.Seek(0, [System.IO.SeekOrigin]::Begin) | Out-Null
-    $buffer = New-Object byte[] (64 * 1024)
-    $collected = New-Object System.IO.MemoryStream
-    try {
-      while ($true) {
-        $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
-        if ($bytesRead -le 0) {
-          break
-        }
-
-        $collected.Write($buffer, 0, $bytesRead)
-        $bytes = $collected.ToArray()
-        $newlineIndex = [Array]::IndexOf($bytes, [byte]10)
-        if ($newlineIndex -ge 0) {
-          $crlf = $newlineIndex -gt 0 -and $bytes[$newlineIndex - 1] -eq [byte]13
-          $lineLength = if ($crlf) { $newlineIndex - 1 } else { $newlineIndex }
-          return @{
-            firstLine = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $lineLength)
-            offset = $newlineIndex + 1
-          }
-        }
-      }
-
-      return @{
-        firstLine = [System.Text.Encoding]::UTF8.GetString($collected.ToArray())
-        offset = [int]$collected.Length
-      }
-    } finally {
-      $collected.Dispose()
-    }
-  }
-
-  $change = Get-Content -Raw -Path $manifestPath | ConvertFrom-Json
-  $path = [string]$change.path
-  $tmpPath = "$path.provider-sync.$PID.$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()).tmp"
-  $backupPath = "$path.provider-sync.$PID.$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()).bak"
-  $encoding = [System.Text.UTF8Encoding]::new($false)
-  $source = $null
-  $writer = $null
-
-  try {
-    try {
-      $source = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-    } catch {
-      if (Test-Path $path) {
-        Write-Output "SKIP_BUSY"
-      } else {
-        Write-Output "SKIP_CHANGED"
-      }
-      return
-    }
-
-    if ([bool]$change.requireOriginalMatch) {
-      if ($source.Length -ne [int64]$change.originalSize) {
-        Write-Output "SKIP_CHANGED"
-        return
-      }
-
-      $record = Read-FirstLineRecord $source
-      if ($record.firstLine -ne [string]$change.originalFirstLine -or $record.offset -ne [int]$change.originalOffset) {
-        Write-Output "SKIP_CHANGED"
-        return
-      }
-
-      $separator = [string]$change.originalSeparator
-      $sourceOffset = [int64]$change.originalOffset
-      $headerOnly = $sourceOffset -ge [int64]$change.originalSize
-    } else {
-      $record = Read-FirstLineRecord $source
-      $separator = [string]$change.separator
-      $sourceOffset = [int64]$record.offset
-      $headerOnly = $record.offset -ge $source.Length
-    }
-
-    $writer = [System.IO.File]::Open($tmpPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-    $firstLineBytes = $encoding.GetBytes([string]$change.updatedFirstLine)
-    $writer.Write($firstLineBytes, 0, $firstLineBytes.Length)
-
-    if (-not [string]::IsNullOrEmpty($separator)) {
-      $separatorBytes = $encoding.GetBytes($separator)
-      $writer.Write($separatorBytes, 0, $separatorBytes.Length)
-    }
-
-    if (-not $headerOnly) {
-      $source.Seek($sourceOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
-      $source.CopyTo($writer)
-    }
-
-    $writer.Flush()
-    $writer.Dispose()
-    $writer = $null
-
-    $source.Dispose()
-    $source = $null
-
-    try {
-      [System.IO.File]::Replace($tmpPath, $path, $backupPath, $true)
-    } catch {
-      if (-not (Test-Path $path)) {
-        Write-Output "SKIP_CHANGED"
-        return
-      }
-      throw
-    }
-
-    Write-Output "APPLIED"
-  } finally {
-    if ($writer) {
-      $writer.Dispose()
-    }
-    if ($source) {
-      $source.Dispose()
-    }
-    Remove-Item -Path $tmpPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -Path $backupPath -Force -ErrorAction SilentlyContinue
-  }
-}
-`.trim();
-
-  try {
-    await fsp.writeFile(
-      manifestPath,
-      JSON.stringify({
-        ...change,
-        requireOriginalMatch
-      }),
-      "utf8"
-    );
-
-    const { stdout } = await execFileAsync("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-Command",
-      script,
-      manifestPath
-    ]);
-
-    const result = stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .at(-1);
-
-    if (result === "APPLIED" || result === "SKIP_BUSY" || result === "SKIP_CHANGED") {
-      return result;
-    }
-
-    throw new Error(`Unexpected rewrite result for ${change.path}: ${stdout.trim() || "(empty output)"}`);
-  } catch (error) {
-    throw wrapRolloutFileBusyError(error, change.path, "rewrite");
-  } finally {
-    await fsp.rm(tempDir, { recursive: true, force: true });
-  }
-}
-
 async function rewriteFirstLine(filePath, nextFirstLine, separator) {
-  if (process.platform === "win32") {
-    const result = await invokeWindowsExclusiveRewrite(
-      {
-        path: filePath,
-        separator,
-        updatedFirstLine: nextFirstLine
-      },
-      { requireOriginalMatch: false }
-    );
-
-    if (result !== "APPLIED") {
-      throw new Error(
-        `Unable to rewrite rollout file because it is currently in use. Close Codex and the Codex app, then retry. Locked file: ${filePath}`
-      );
-    }
-
-    return;
-  }
-
   const current = await readFirstLineRecord(filePath);
   const tmpPath = `${filePath}.provider-sync.${process.pid}.${Date.now()}.tmp`;
   const writer = fs.createWriteStream(tmpPath, { encoding: "utf8" });
@@ -329,11 +146,6 @@ async function rewriteFirstLine(filePath, nextFirstLine, separator) {
 }
 
 async function tryRewriteCollectedFirstLine(change) {
-  if (process.platform === "win32") {
-    const result = await invokeWindowsExclusiveRewrite(change, { requireOriginalMatch: true });
-    return result === "APPLIED";
-  }
-
   const beforeSnapshot = await getFileSnapshot(change.path);
   if (!snapshotMatches(change, beforeSnapshot)) {
     return false;
@@ -427,7 +239,8 @@ async function findLockedFilesOnWindows(filePaths) {
 
 export async function collectSessionChanges(codexHome, targetProvider, options = {}) {
   const {
-    skipLockedReads = false
+    skipLockedReads = false,
+    statusOnly = false
   } = options;
   const summaries = [];
   const lockedPaths = [];
@@ -459,7 +272,7 @@ export async function collectSessionChanges(codexHome, targetProvider, options =
       const currentProvider = parsed.payload.model_provider ?? "(missing)";
       providerCounts[dirName].set(currentProvider, (providerCounts[dirName].get(currentProvider) ?? 0) + 1);
 
-      if (targetProvider !== "__status_only__" && parsed.payload.model_provider !== targetProvider) {
+      if (!statusOnly && parsed.payload.model_provider !== targetProvider) {
         const snapshot = await getFileSnapshot(rolloutPath);
         parsed.payload.model_provider = targetProvider;
         summaries.push({
@@ -480,14 +293,254 @@ export async function collectSessionChanges(codexHome, targetProvider, options =
   return { changes: summaries, lockedPaths, providerCounts };
 }
 
+const WINDOWS_BATCH_REWRITE_SCRIPT = `
+& {
+  param([string]$manifestPath)
+
+  function Read-FirstLineRecord([System.IO.FileStream]$stream) {
+    $stream.Seek(0, [System.IO.SeekOrigin]::Begin) | Out-Null
+    $buffer = New-Object byte[] (64 * 1024)
+    $collected = New-Object System.IO.MemoryStream
+    try {
+      while ($true) {
+        $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
+        if ($bytesRead -le 0) {
+          break
+        }
+
+        $collected.Write($buffer, 0, $bytesRead)
+        $bytes = $collected.ToArray()
+        $newlineIndex = [Array]::IndexOf($bytes, [byte]10)
+        if ($newlineIndex -ge 0) {
+          $crlf = $newlineIndex -gt 0 -and $bytes[$newlineIndex - 1] -eq [byte]13
+          $lineLength = if ($crlf) { $newlineIndex - 1 } else { $newlineIndex }
+          return @{
+            firstLine = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $lineLength)
+            offset = $newlineIndex + 1
+          }
+        }
+      }
+
+      return @{
+        firstLine = [System.Text.Encoding]::UTF8.GetString($collected.ToArray())
+        offset = [int]$collected.Length
+      }
+    } finally {
+      $collected.Dispose()
+    }
+  }
+
+  function Invoke-RewriteOne($change, [int]$index) {
+    $path = [string]$change.path
+    $stamp = "$PID.$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()).$index"
+    $tmpPath = "$path.provider-sync.$stamp.tmp"
+    $backupPath = "$path.provider-sync.$stamp.bak"
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    $source = $null
+    $writer = $null
+
+    try {
+      try {
+        $source = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+      } catch {
+        if (Test-Path $path) {
+          return "SKIP_BUSY"
+        }
+        return "SKIP_CHANGED"
+      }
+
+      if ([bool]$change.requireOriginalMatch) {
+        if ($source.Length -ne [int64]$change.originalSize) {
+          return "SKIP_CHANGED"
+        }
+
+        $record = Read-FirstLineRecord $source
+        if ($record.firstLine -ne [string]$change.originalFirstLine -or $record.offset -ne [int]$change.originalOffset) {
+          return "SKIP_CHANGED"
+        }
+
+        $separator = [string]$change.originalSeparator
+        $sourceOffset = [int64]$change.originalOffset
+        $headerOnly = $sourceOffset -ge [int64]$change.originalSize
+      } else {
+        $record = Read-FirstLineRecord $source
+        $separator = [string]$change.separator
+        $sourceOffset = [int64]$record.offset
+        $headerOnly = $record.offset -ge $source.Length
+      }
+
+      $writer = [System.IO.File]::Open($tmpPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+      $firstLineBytes = $encoding.GetBytes([string]$change.updatedFirstLine)
+      $writer.Write($firstLineBytes, 0, $firstLineBytes.Length)
+
+      if (-not [string]::IsNullOrEmpty($separator)) {
+        $separatorBytes = $encoding.GetBytes($separator)
+        $writer.Write($separatorBytes, 0, $separatorBytes.Length)
+      }
+
+      if (-not $headerOnly) {
+        $source.Seek($sourceOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
+        $source.CopyTo($writer)
+      }
+
+      $writer.Flush()
+      $writer.Dispose()
+      $writer = $null
+
+      $source.Dispose()
+      $source = $null
+
+      try {
+        [System.IO.File]::Replace($tmpPath, $path, $backupPath, $true)
+      } catch {
+        if (-not (Test-Path $path)) {
+          return "SKIP_CHANGED"
+        }
+        throw
+      }
+
+      return "APPLIED"
+    } finally {
+      if ($writer) {
+        $writer.Dispose()
+      }
+      if ($source) {
+        $source.Dispose()
+      }
+      Remove-Item -Path $tmpPath -Force -ErrorAction SilentlyContinue
+      Remove-Item -Path $backupPath -Force -ErrorAction SilentlyContinue
+    }
+  }
+
+  $changes = Get-Content -Raw -Path $manifestPath | ConvertFrom-Json
+  $index = 0
+  foreach ($change in $changes) {
+    try {
+      $status = Invoke-RewriteOne $change $index
+    } catch {
+      $status = "ERROR:" + $_.Exception.Message
+    }
+    Write-Output ($status + "|" + [string]$change.path)
+    $index = $index + 1
+  }
+}
+`.trim();
+
+export function parseWindowsRewriteStatuses(stdout) {
+  const statusByPath = new Map();
+  for (const line of stdout.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const separatorIndex = trimmed.indexOf("|");
+    if (separatorIndex === -1) {
+      continue;
+    }
+    statusByPath.set(trimmed.slice(separatorIndex + 1), trimmed.slice(0, separatorIndex));
+  }
+  return statusByPath;
+}
+
+export function parseWindowsRewriteResults(stdout, changes) {
+  const statusByPath = parseWindowsRewriteStatuses(stdout);
+
+  const appliedPaths = [];
+  const skippedPaths = [];
+  const unexpected = [];
+  for (const change of changes) {
+    const status = statusByPath.get(change.path);
+    if (status === "APPLIED") {
+      appliedPaths.push(change.path);
+    } else if (status === "SKIP_BUSY" || status === "SKIP_CHANGED") {
+      skippedPaths.push(change.path);
+    } else {
+      unexpected.push(`${change.path}: ${status ?? "(no result)"}`);
+    }
+  }
+
+  appliedPaths.sort((left, right) => left.localeCompare(right));
+  skippedPaths.sort((left, right) => left.localeCompare(right));
+
+  if (unexpected.length > 0) {
+    // The PowerShell batch runs to completion before returning, so every
+    // APPLIED file is already on disk. Hand the caller the full applied set so
+    // it can roll them ALL back — not just the ones before the first error.
+    const error = new Error(`Unexpected rewrite result(s): ${unexpected.join("; ")}`);
+    error.appliedPaths = appliedPaths;
+    throw error;
+  }
+
+  return {
+    appliedChanges: appliedPaths.length,
+    appliedPaths,
+    skippedPaths
+  };
+}
+
+async function runWindowsRewriteBatch(batchChanges) {
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-provider-rewrite-"));
+  const manifestPath = path.join(tempDir, "changes.json");
+  try {
+    await fsp.writeFile(manifestPath, JSON.stringify(batchChanges), "utf8");
+    try {
+      const { stdout } = await execFileAsync(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          WINDOWS_BATCH_REWRITE_SCRIPT,
+          manifestPath
+        ],
+        { maxBuffer: 64 * 1024 * 1024 }
+      );
+      return stdout;
+    } catch (error) {
+      throw wrapRolloutFileBusyError(error, batchChanges[0]?.path ?? "(unknown)", "rewrite");
+    }
+  } finally {
+    await fsp.rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function applySessionChangesWindows(changes) {
+  const stdout = await runWindowsRewriteBatch(changes.map((change) => ({
+    path: change.path,
+    originalSize: change.originalSize,
+    originalFirstLine: change.originalFirstLine,
+    originalOffset: change.originalOffset,
+    originalSeparator: change.originalSeparator,
+    updatedFirstLine: change.updatedFirstLine,
+    requireOriginalMatch: true
+  })));
+  return parseWindowsRewriteResults(stdout, changes);
+}
+
 export async function applySessionChanges(changes) {
+  if (!changes.length) {
+    return { appliedChanges: 0, appliedPaths: [], skippedPaths: [] };
+  }
+
+  if (process.platform === "win32") {
+    return applySessionChangesWindows(changes);
+  }
+
   const skippedPaths = [];
   const appliedPaths = [];
-  let appliedChanges = 0;
 
   for (const change of changes) {
-    if (await tryRewriteCollectedFirstLine(change)) {
-      appliedChanges += 1;
+    let applied;
+    try {
+      applied = await tryRewriteCollectedFirstLine(change);
+    } catch (error) {
+      // Preserve the files already rewritten so the caller can roll them back;
+      // otherwise a mid-batch failure would leave them silently changed.
+      error.appliedPaths = [...appliedPaths];
+      throw error;
+    }
+    if (applied) {
       appliedPaths.push(change.path);
     } else {
       skippedPaths.push(change.path);
@@ -497,7 +550,7 @@ export async function applySessionChanges(changes) {
   appliedPaths.sort((left, right) => left.localeCompare(right));
   skippedPaths.sort((left, right) => left.localeCompare(right));
   return {
-    appliedChanges,
+    appliedChanges: appliedPaths.length,
     appliedPaths,
     skippedPaths
   };
@@ -553,18 +606,48 @@ export async function splitLockedSessionChanges(changes) {
   };
 }
 
-export async function restoreSessionChanges(manifestEntries) {
+async function restoreSessionChangesPosix(manifestEntries) {
   const failures = [];
   for (const entry of manifestEntries) {
     try {
       await rewriteFirstLine(entry.path, entry.originalFirstLine, entry.originalSeparator ?? "");
     } catch (error) {
-      failures.push({
-        path: entry.path,
-        message: error.message
-      });
+      failures.push({ path: entry.path, message: error.message });
     }
   }
+  return failures;
+}
+
+export function collectWindowsRestoreFailures(stdout, manifestEntries) {
+  const statusByPath = parseWindowsRewriteStatuses(stdout);
+  const failures = [];
+  for (const entry of manifestEntries) {
+    const status = statusByPath.get(entry.path);
+    if (status !== "APPLIED") {
+      failures.push({ path: entry.path, message: `rewrite result: ${status ?? "(no result)"}` });
+    }
+  }
+  return failures;
+}
+
+async function restoreSessionChangesWindows(manifestEntries) {
+  const stdout = await runWindowsRewriteBatch(manifestEntries.map((entry) => ({
+    path: entry.path,
+    separator: entry.originalSeparator ?? "",
+    updatedFirstLine: entry.originalFirstLine,
+    requireOriginalMatch: false
+  })));
+  return collectWindowsRestoreFailures(stdout, manifestEntries);
+}
+
+export async function restoreSessionChanges(manifestEntries) {
+  if (!manifestEntries.length) {
+    return;
+  }
+
+  const failures = process.platform === "win32"
+    ? await restoreSessionChangesWindows(manifestEntries)
+    : await restoreSessionChangesPosix(manifestEntries);
 
   if (failures.length > 0) {
     const details = failures
