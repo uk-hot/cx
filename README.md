@@ -210,7 +210,7 @@ closing Codex to sync them.
 
 ## Changelog
 
-### Unreleased
+### 0.2.11
 
 - `cx status` shows the live 5-hour and weekly quota left on every account signed
   in with ChatGPT, after the local status.
