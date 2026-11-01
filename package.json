@@ -1,6 +1,6 @@
 {
   "name": "@uk-hot/cx",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "Synchronize Codex session provider metadata across rollout files and SQLite state.",
   "type": "module",
   "files": [

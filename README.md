@@ -173,7 +173,7 @@ closing Codex to sync them.
 
 ## Changelog
 
-### Unreleased
+### 0.2.10
 
 - `cx switch` and a `cx add` that signs in restart a running Codex app-server
   daemon, which otherwise keeps sending requests as the previous account (and
