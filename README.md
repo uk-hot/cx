@@ -81,6 +81,11 @@ An API key that isn't saved yet would be replaced by a sign-in, so `cx add`
 without an alias stops and asks for one. Once it is saved, `cx add` signs in as
 usual.
 
+Like `cx switch`, a `cx add` that signs in (including one that refreshes an
+already registered account) restarts a running Codex app-server daemon so it
+uses the new login (see below). Snapshotting a third-party provider or an API
+key doesn't change the login, so it leaves the daemon alone.
+
 ### `cx switch <email|alias>`
 
 Restores a registered account's `auth.json` and its provider/model settings from
@@ -100,6 +105,21 @@ Only these `config.toml` settings belong to an account: `model_provider`,
 and sandbox settings, TUI state — is kept from the live config, so changes made
 after `cx add` survive a switch.
 
+Codex sessions send their requests through a shared app-server daemon
+(`codex app-server --managed-daemon`), which reads `auth.json` only when it
+starts. Without a restart, sessions opened or resumed after a switch would keep
+using the previous account and its usage limits. So after a successful switch
+`cx` runs `codex app-server daemon restart` — only if the daemon is running; it
+never starts one. Codex sessions that were open are disconnected; reopen them
+with `codex resume`. The daemon keeps the rollout files of open sessions open,
+so the switch skips them; once the daemon has restarted, `cx` syncs those files
+too. To keep a running task from being interrupted, let it finish before
+switching. If the restart fails, `cx` keeps the switch and prints the command to
+run.
+
+A missing `config.toml` is fine: it means Codex's defaults, i.e. the `openai`
+provider.
+
 ### `cx list`
 
 Lists the accounts registered in the registry (email/alias and provider), marking the
@@ -113,7 +133,11 @@ Removes a registered account and its snapshot files from the registry. An
 identifier that only partially matches an account must be confirmed in a TTY.
 Removing the account Codex is logged in to leaves `auth.json` as it is, so Codex
 stays signed in, but neither `cx switch` nor `cx add` registers that login
-again. To add it back, sign in to it with `cx add`.
+again. To add it back, sign in to it with `cx add`. A removed API key that is
+still in `auth.json` no longer counts as unsaved, so `cx switch` and `cx add`
+can replace it (the registry keeps only its SHA-256 digest); `cx add <alias>`
+adds it back. `cx remove` doesn't change the login, so it never restarts the
+Codex app-server daemon.
 
 ## How it works
 
@@ -148,6 +172,18 @@ closing Codex to sync them.
 - Close Codex and the Codex app before switching if files are reported as locked.
 
 ## Changelog
+
+### Unreleased
+
+- `cx switch` and a `cx add` that signs in restart a running Codex app-server
+  daemon, which otherwise keeps sending requests as the previous account (and
+  hits its usage limits). After the restart, `cx switch` also syncs the rollout
+  files the daemon had open.
+- `cx switch` and `cx status` work without `~/.codex/config.toml`.
+- A failed switch now restores every file in `~/.codex/accounts/`, removing
+  snapshots it had just created, and restores files atomically with their mode.
+- Removing the API key Codex is using no longer blocks `cx switch` and `cx add`
+  with "The current login ... is not saved".
 
 ### 0.2.9
 

@@ -21,7 +21,8 @@ test("add registers a manual account", async (t) => {
     "utf8"
   );
 
-  const env = { ...process.env, HOME: home };
+  // No codex on PATH: the daemon check must not reach a real Codex install.
+  const env = { ...process.env, HOME: home, PATH: home };
   const { stdout } = await execFileAsync(process.execPath, [cliPath, "add", "third-party"], {
     env,
     encoding: "utf8"

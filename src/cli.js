@@ -15,6 +15,7 @@ import {
   syncActiveAccountFromCurrentAuth,
   useAccount
 } from "./auth-service.js";
+import { restartCodexDaemon } from "./codex-daemon.js";
 import { runCodexForLogin } from "./codex-login.js";
 import { defaultCodexHome } from "./constants.js";
 
@@ -112,6 +113,37 @@ function summarizeSync(result, label) {
 
 function printAddedAccount(result) {
   console.log(`Added account: ${result.email ?? result.accountKey}${result.alias ? ` (alias: ${result.alias})` : ""}`);
+}
+
+// Runs after the login in ~/.codex changed. The command already succeeded, so a
+// failed restart is a warning with the manual fix, not an error. Returns whether
+// the daemon was restarted.
+async function restartDaemonForNewLogin() {
+  let result;
+  try {
+    result = await restartCodexDaemon(resolveHome());
+  } catch (error) {
+    result = { status: "failed", detail: error instanceof Error ? error.message : String(error) };
+  }
+  if (result.status === "restarted") {
+    console.log("Restarted the Codex app-server daemon so it uses this login. Reopen Codex sessions that were running (codex resume).");
+  } else if (result.status === "failed") {
+    console.warn(`Could not restart the Codex app-server daemon (${result.detail}). It still uses the previous login; run: codex app-server daemon restart`);
+  }
+  return result.status === "restarted";
+}
+
+// The daemon keeps the rollout files of open sessions open, so the switch had to
+// skip them. Its restart closed them: sync them now instead of on the next switch.
+async function resyncSkippedRollouts(switchResult) {
+  try {
+    const { runSync } = await loadServiceModule();
+    const result = await runSync({ codexHome: resolveHome(), provider: switchResult.targetProvider });
+    console.log(summarizeSync(result, "Re-synchronized"));
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`Could not sync the rollout files skipped by the switch (${message}). Run cx switch again to sync them.`);
+  }
 }
 
 function accountLabel(account) {
@@ -249,6 +281,9 @@ async function main() {
     const label = acct?.email ?? acct?.alias ?? identifier;
     console.log(`Switched account: ${label}${acct?.provider ? ` [${acct.provider}]` : ""}`);
     console.log(summarizeSync(result, "Synchronized"));
+    if (await restartDaemonForNewLogin() && result.skippedLockedRolloutFiles?.length) {
+      await resyncSkippedRollouts(result);
+    }
     return;
   }
 
@@ -256,6 +291,8 @@ async function main() {
     assertNoExtraPositionals(positionals, 2, "cx add [alias]");
     const alias = positionals[1] ?? flags.alias;
 
+    // Snapshotting a third-party provider or an API key leaves the login as it
+    // is, so the daemon needs no restart.
     if (!await addNeedsLogin(resolveHome())) {
       printAddedAccount(await addAccount(resolveHome(), alias));
       return;
@@ -273,9 +310,10 @@ async function main() {
     if (result.alreadyRegistered) {
       console.log(`Refreshed already registered account: ${result.email ?? result.accountKey}`);
       console.log("To add a different account, sign out of auth.openai.com in the browser or use a private window.");
-      return;
+    } else {
+      printAddedAccount(result);
     }
-    printAddedAccount(result);
+    await restartDaemonForNewLogin();
     return;
   }
 

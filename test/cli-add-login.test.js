@@ -32,7 +32,9 @@ function oauthAuth(name) {
 const apiKeyAuth = JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: "sk-test" });
 
 // A codex stand-in that records how it started, then "signs in" with FAKE_LOGIN_AUTH.
+// Daemon commands report "not running", so cx leaves the daemon alone.
 const fakeCodex = `#!/bin/sh
+[ "$1" = "app-server" ] && exit 1
 printf '%s\\n' "$*" > "$FAKE_DIR/args"
 printf '%s\\n' "$CODEX_HOME" > "$FAKE_DIR/codex-home"
 [ -e "$CODEX_HOME/auth.json" ] && touch "$FAKE_DIR/saw-auth"

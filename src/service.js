@@ -1,11 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
+import { writeFileAtomically } from "./auth-service.js";
 import {
   ACCOUNTS_DIR_NAME,
   AUTH_FILE_NAME,
   DEFAULT_PROVIDER,
-  REGISTRY_FILE_NAME,
   defaultCodexHome
 } from "./constants.js";
 import {
@@ -37,10 +37,12 @@ async function ensureCodexHome(codexHome) {
 
 async function readTextFileSnapshot(filePath) {
   try {
+    const [text, stat] = await Promise.all([fs.readFile(filePath, "utf8"), fs.stat(filePath)]);
     return {
       path: filePath,
       exists: true,
-      text: await fs.readFile(filePath, "utf8")
+      text,
+      mode: stat.mode & 0o777
     };
   } catch (error) {
     if (error?.code === "ENOENT") {
@@ -54,25 +56,61 @@ async function readTextFileSnapshot(filePath) {
   }
 }
 
+// Every file in a directory, plus the directory itself so files created later
+// can be told apart and removed on restore.
+async function readDirectorySnapshot(dirPath) {
+  let entries;
+  try {
+    entries = await fs.readdir(dirPath, { withFileTypes: true });
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { path: dirPath, files: [] };
+    }
+    throw error;
+  }
+  const files = await Promise.all(entries
+    .filter((entry) => entry.isFile())
+    .map((entry) => readTextFileSnapshot(path.join(dirPath, entry.name))));
+  return { path: dirPath, files };
+}
+
 async function restoreTextFileSnapshot(snapshot) {
   if (snapshot.exists) {
     await fs.mkdir(path.dirname(snapshot.path), { recursive: true });
-    await fs.writeFile(snapshot.path, snapshot.text, "utf8");
+    // Atomic, so an interrupted restore cannot leave a truncated auth.json.
+    await writeFileAtomically(snapshot.path, snapshot.text, { mode: snapshot.mode });
     return;
   }
   await fs.rm(snapshot.path, { force: true });
 }
 
-async function restoreTextFileSnapshots(snapshots) {
+async function restoreTextFileSnapshots(snapshots, directorySnapshots = []) {
   const failures = [];
-  for (const snapshot of snapshots) {
+  const restore = async (filePath, action) => {
     try {
-      await restoreTextFileSnapshot(snapshot);
+      await action();
     } catch (error) {
       failures.push({
-        path: snapshot.path,
+        path: filePath,
         message: error.message
       });
+    }
+  };
+
+  for (const snapshot of snapshots) {
+    await restore(snapshot.path, () => restoreTextFileSnapshot(snapshot));
+  }
+  for (const directory of directorySnapshots) {
+    const known = new Set(directory.files.map((file) => file.path));
+    const current = await fs.readdir(directory.path).catch(() => []);
+    for (const name of current) {
+      const filePath = path.join(directory.path, name);
+      if (!known.has(filePath)) {
+        await restore(filePath, () => fs.rm(filePath, { force: true }));
+      }
+    }
+    for (const snapshot of directory.files) {
+      await restore(snapshot.path, () => restoreTextFileSnapshot(snapshot));
     }
   }
   return failures;
@@ -330,12 +368,13 @@ export async function runSwitch({
   try {
     const configPath = path.join(codexHome, "config.toml");
     const authPath = path.join(codexHome, AUTH_FILE_NAME);
-    const registryPath = path.join(codexHome, ACCOUNTS_DIR_NAME, REGISTRY_FILE_NAME);
     const snapshots = await Promise.all([
       readTextFileSnapshot(configPath),
-      readTextFileSnapshot(authPath),
-      readTextFileSnapshot(registryPath)
+      readTextFileSnapshot(authPath)
     ]);
+    // The registry and the account snapshots: a switch refreshes the outgoing
+    // account's snapshots and may register the live login with new ones.
+    const accountsSnapshot = await readDirectorySnapshot(path.join(codexHome, ACCOUNTS_DIR_NAME));
 
     try {
       const useResult = await useAccountFn(codexHome, identifier);
@@ -352,7 +391,7 @@ export async function runSwitch({
         switchedAccount: useResult
       };
     } catch (error) {
-      const restoreFailures = await restoreTextFileSnapshots(snapshots);
+      const restoreFailures = await restoreTextFileSnapshots(snapshots, [accountsSnapshot]);
       if (restoreFailures.length > 0) {
         throw new Error(
           `Failed to restore switch state after sync error. Original error: ${error.message}. Restore error(s): ${formatRestoreFailures(restoreFailures)}`

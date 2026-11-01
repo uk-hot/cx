@@ -8,6 +8,7 @@ import {
   accountKeyToConfigFilename,
   accountKeyToFilename,
   addAccount,
+  addNeedsLogin,
   removeAccount,
   syncActiveAccountFromCurrentAuth,
   useAccount
@@ -295,4 +296,55 @@ test("switch refuses to replace an API-key login that is not saved", async (t) =
   await addAccount(codexHome, "key");
   await useAccount(codexHome, "one");
   assert.equal(JSON.parse(await fs.readFile(authPath, "utf8")).tokens.refresh_token, "token-1");
+});
+
+const apiKeyAuth = (key) => JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: key });
+
+// The API key "key" is registered and in use.
+async function setupLiveApiKey(t, prefix) {
+  const ctx = await setupTwoLogins(t, prefix);
+  await fs.writeFile(ctx.authPath, apiKeyAuth("sk-removed"), "utf8");
+  await addAccount(ctx.codexHome, "key");
+  return ctx;
+}
+
+test("removing the API key in use lets switch and add replace it", async (t) => {
+  const { codexHome, authPath, readRegistry } = await setupLiveApiKey(t, "cx-auth-remove-key-");
+
+  await removeAccount(codexHome, "key");
+  const registryText = await fs.readFile(path.join(codexHome, "accounts", "registry.json"), "utf8");
+  assert.doesNotMatch(registryText, /sk-removed/, "the registry must not hold the API key");
+  assert.match(JSON.parse(registryText).removed_auth_sha256, /^[0-9a-f]{64}$/);
+  assert.equal(await addNeedsLogin(codexHome), true);
+
+  await useAccount(codexHome, "one");
+  assert.equal(JSON.parse(await fs.readFile(authPath, "utf8")).tokens.refresh_token, "token-1");
+  assert.equal((await readRegistry()).removed_auth_sha256, undefined);
+});
+
+test("a removed API key still protects a different unsaved API key", async (t) => {
+  const { codexHome, authPath } = await setupLiveApiKey(t, "cx-auth-remove-key-other-");
+
+  await removeAccount(codexHome, "key");
+  await fs.writeFile(authPath, apiKeyAuth("sk-other"), "utf8");
+  await assert.rejects(useAccount(codexHome, "one"), /not saved.*cx add <alias>/);
+  assert.equal(await fs.readFile(authPath, "utf8"), apiKeyAuth("sk-other"));
+});
+
+test("adding a removed API key back ends the removal", async (t) => {
+  const { codexHome, readRegistry } = await setupLiveApiKey(t, "cx-auth-readd-key-");
+
+  await removeAccount(codexHome, "key");
+  await addAccount(codexHome, "key");
+  const registry = await readRegistry();
+  assert.equal(registry.removed_auth_sha256, undefined);
+  assert.ok(registry.accounts.some((account) => account.account_key === "manual::key"));
+});
+
+test("removing an API key that is not in use records nothing", async (t) => {
+  const { codexHome, authPath, readRegistry } = await setupLiveApiKey(t, "cx-auth-remove-key-idle-");
+  await writeJson(authPath, oauthAuth({ userId: "user-2", accountId: "account-2", refreshToken: "token-2" }));
+
+  await removeAccount(codexHome, "key");
+  assert.equal((await readRegistry()).removed_auth_sha256, undefined);
 });

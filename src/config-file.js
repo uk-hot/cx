@@ -205,8 +205,17 @@ function tableStatements(table) {
     .map((entry) => ({ path: entry.path, lines: [entry.line] }));
 }
 
+// A missing config.toml is valid: Codex then runs with its defaults, which the
+// empty text describes (the default provider).
 export async function readConfigText(configPath) {
-  return fs.readFile(configPath, "utf8");
+  try {
+    return await fs.readFile(configPath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return "";
+    }
+    throw error;
+  }
 }
 
 export function readCurrentProviderFromConfigText(configText) {

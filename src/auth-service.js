@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -195,7 +195,7 @@ async function fileModeOr(filePath, fallbackMode) {
   }
 }
 
-async function writeFileAtomically(filePath, text, { mode = 0o600 } = {}) {
+export async function writeFileAtomically(filePath, text, { mode = 0o600 } = {}) {
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   try {
     await fs.writeFile(temporaryPath, text, { encoding: "utf8", mode });
@@ -465,6 +465,9 @@ async function registerAccount(codexHome, { parsed, alias, provider, authText, c
   if (parsed || accountKey === registry.removed_account_key) {
     delete registry.removed_account_key;
   }
+  if (parsed || (authText !== null && registry.removed_auth_sha256 === authDigest(authText))) {
+    delete registry.removed_auth_sha256;
+  }
 
   const now = Math.floor(Date.now() / 1000);
   const accountEntry = {
@@ -529,16 +532,27 @@ async function isAuthSnapshotted(codexHome, authText) {
   return false;
 }
 
+// Identifies a non-OAuth login (which has no account key) without storing the
+// API key itself in the registry.
+function authDigest(authText) {
+  return createHash("sha256").update(authText).digest("hex");
+}
+
 // An API key or other non-OAuth login of the OpenAI provider exists only in
 // auth.json until a snapshot holds it, so replacing auth.json would lose it.
+// A login whose account was removed with `cx remove` was given up on purpose.
 async function hasUnsavedNonOAuthLogin(codexHome) {
   if ((await readProviderFromConfig(codexHome) ?? DEFAULT_PROVIDER) !== DEFAULT_PROVIDER) {
     return false;
   }
   const authText = await readTextIfExists(resolveAuthPath(codexHome));
-  return authText !== null
-    && parseAuthText(authText) === null
-    && !await isAuthSnapshotted(codexHome, authText);
+  if (authText === null || parseAuthText(authText) !== null) {
+    return false;
+  }
+  if ((await readRegistry(codexHome)).removed_auth_sha256 === authDigest(authText)) {
+    return false;
+  }
+  return !await isAuthSnapshotted(codexHome, authText);
 }
 
 // Third-party accounts and API keys have no browser login: what is in ~/.codex
@@ -668,6 +682,7 @@ export async function useAccount(codexHome, identifier) {
   registry.active_account_activated_at_ms = Date.now();
   // auth.json no longer holds the removed account's login.
   delete registry.removed_account_key;
+  delete registry.removed_auth_sha256;
   await writeRegistry(codexHome, registry);
 
   return {
@@ -699,14 +714,21 @@ export async function removeAccount(codexHome, identifier) {
     const removed = registry.accounts.splice(index, 1)[0];
 
     const paths = snapshotPaths(codexHome, removed.account_key);
+    const removedAuthText = await readTextIfExists(paths.auth);
     await fs.rm(paths.auth, { force: true });
     await fs.rm(paths.config, { force: true });
 
     // Codex may still be logged in to the removed account. Remember it, so that
     // neither `cx switch` nor `cx add` registers that login again on its own.
-    const live = parseAuthText(await readTextIfExists(resolveAuthPath(codexHome)));
+    const liveAuthText = await readTextIfExists(resolveAuthPath(codexHome));
+    const live = parseAuthText(liveAuthText);
     if (live?.accountKey === removed.account_key) {
       registry.removed_account_key = removed.account_key;
+    }
+    // An API key has no account key; remember it by digest, so that it no longer
+    // counts as an unsaved login that blocks `cx switch` and `cx add`.
+    if (!live && liveAuthText !== null && liveAuthText === removedAuthText) {
+      registry.removed_auth_sha256 = authDigest(liveAuthText);
     }
 
     if (registry.active_account_key === removed.account_key || live?.accountKey === removed.account_key) {
