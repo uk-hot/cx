@@ -38,9 +38,33 @@ cx remove <email|alias>
 
 ### `cx status`
 
-Shows the current provider (from `~/.codex/config.toml`) and the per-provider
-counts found in your rollout files and in the SQLite state, so you can see at a
-glance whether everything is aligned.
+Shows the live 5-hour and weekly quota left on every registered OpenAI account
+signed in with ChatGPT, with the active one marked `*`:
+
+```text
+ACCOUNT USAGE
++---------------------+------+------------------------+-------------------------+
+| ACCOUNT             | PLAN | 5H LEFT                | WEEKLY LEFT             |
++---------------------+------+------------------------+-------------------------+
+| * one@example.com   | team | 33% (resets in 3h 40m) | 90% (resets in 6d 22h)  |
+|   two@example.com   | plus | 0% (resets in 9m)      | 22% (resets in 5d 20h)  |
++---------------------+------+------------------------+-------------------------+
+```
+
+API-key logins and third-party providers have no such limits and are left out.
+An account that cannot be read shows why, and the others are still listed:
+
+- `sign-in expired`: its saved access token has expired. `cx status` never
+  refreshes tokens, because a refresh token is single-use and refreshing one here
+  could sign out a running Codex. `cx switch` to the account and use Codex to
+  renew it.
+- `no saved login`: its snapshot is missing or belongs to another account.
+- `timed out`, `unreachable`, `HTTP <code>`, `unexpected response`: the usage
+  request failed.
+
+Below that it shows the current provider (from `~/.codex/config.toml`) and the
+per-provider counts found in your rollout files and in the SQLite state, so you
+can see at a glance whether everything is aligned.
 
 ### `cx add [alias]`
 
@@ -166,12 +190,21 @@ closing Codex to sync them.
 ## Data & safety
 
 - `cx` reads and writes only under `~/.codex`.
+- `cx status` sends each OpenAI account's access token to
+  `https://chatgpt.com/backend-api/wham/usage`, the undocumented endpoint behind
+  Codex's own usage display, which may change without notice. No other command
+  contacts a usage API, and nothing is cached or written.
 - `cx add` copies your `auth.json` (OAuth tokens or API keys) and `config.toml`
   into `~/.codex/accounts/`, readable by the owner only. Treat that directory as
   sensitive.
 - Close Codex and the Codex app before switching if files are reported as locked.
 
 ## Changelog
+
+### Unreleased
+
+- `cx status` leads with the live 5-hour and weekly quota left on every OpenAI
+  account signed in with ChatGPT.
 
 ### 0.2.10
 
