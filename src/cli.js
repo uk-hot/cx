@@ -10,9 +10,12 @@ import {
   listAccounts,
   removeAccount,
   addAccount,
+  addAccountWithLogin,
+  addNeedsLogin,
   syncActiveAccountFromCurrentAuth,
   useAccount
 } from "./auth-service.js";
+import { runCodexForLogin } from "./codex-login.js";
 import { defaultCodexHome } from "./constants.js";
 
 function resolveHome() {
@@ -72,7 +75,6 @@ function validateFlags(command, flags) {
     status: new Set(),
     switch: new Set(["account"]),
     add: new Set(["alias"]),
-    save: new Set(["alias"]),
     list: new Set(),
     remove: new Set(["account"])
   };
@@ -106,6 +108,10 @@ function summarizeSync(result, label) {
     lines.push(`Locked file(s): ${preview}${extraCount > 0 ? ` (+${extraCount} more)` : ""}`);
   }
   return lines.join("\n");
+}
+
+function printAddedAccount(result) {
+  console.log(`Added account: ${result.email ?? result.accountKey}${result.alias ? ` (alias: ${result.alias})` : ""}`);
 }
 
 function accountLabel(account) {
@@ -246,14 +252,30 @@ async function main() {
     return;
   }
 
-  if (command === "add" || command === "save") {
-    if (command === "save") {
-      console.error("`cx save` is deprecated; use `cx add` instead.");
-    }
+  if (command === "add") {
     assertNoExtraPositionals(positionals, 2, "cx add [alias]");
     const alias = positionals[1] ?? flags.alias;
-    const result = await addAccount(resolveHome(), alias);
-    console.log(`Added account: ${result.email ?? result.accountKey}${result.alias ? ` (alias: ${result.alias})` : ""}`);
+
+    if (!await addNeedsLogin(resolveHome())) {
+      printAddedAccount(await addAccount(resolveHome(), alias));
+      return;
+    }
+
+    const result = await addAccountWithLogin(resolveHome(), alias, {
+      onCurrentSaved(saved) {
+        if (saved) {
+          console.log(`Saved current account: ${saved.email ?? saved.accountKey}`);
+        }
+        console.log("Opening Codex. Choose how to sign in, then exit Codex to finish adding the account.");
+      },
+      runCodex: () => runCodexForLogin(resolveHome())
+    });
+    if (result.alreadyRegistered) {
+      console.log(`Refreshed already registered account: ${result.email ?? result.accountKey}`);
+      console.log("To add a different account, sign out of auth.openai.com in the browser or use a private window.");
+      return;
+    }
+    printAddedAccount(result);
     return;
   }
 

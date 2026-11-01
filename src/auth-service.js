@@ -129,6 +129,18 @@ export function parseAuthFile(authData) {
   };
 }
 
+// auth.json that is not in the OpenAI OAuth format is fine for third-party logins.
+function parseAuthText(authText) {
+  if (authText === null) {
+    return null;
+  }
+  try {
+    return parseAuthFile(JSON.parse(authText));
+  } catch {
+    return null;
+  }
+}
+
 // Snapshot names use base64url so a key can never produce a "/" in the name.
 function encodeAccountKey(accountKey) {
   return Buffer.from(accountKey, "utf8").toString("base64url");
@@ -405,14 +417,7 @@ export async function addAccount(codexHome, alias) {
 
   const provider = configText === null ? null : readCurrentProviderFromConfigText(configText).provider;
 
-  let parsed = null;
-  if (authText !== null) {
-    try {
-      parsed = parseAuthFile(JSON.parse(authText));
-    } catch {
-      // auth.json exists but is not OpenAI OAuth format — that's fine for third-party
-    }
-  }
+  let parsed = parseAuthText(authText);
   // ChatGPT tokens left in auth.json only identify the account when Codex is
   // actually using the OpenAI provider; otherwise this is a third-party login
   // and must not overwrite the ChatGPT account's registration.
@@ -420,77 +425,163 @@ export async function addAccount(codexHome, alias) {
     parsed = null;
   }
 
-  let accountKey;
-  let email = null;
-  let authMode = "manual";
-
-  if (parsed) {
-    accountKey = parsed.accountKey;
-    email = parsed.email;
-    authMode = parsed.authMode;
-  } else {
-    if (!alias) {
-      throw new Error(`Cannot auto-detect account identity for provider "${provider ?? DEFAULT_PROVIDER}". Provide an alias: cx add <alias>`);
-    }
-    accountKey = `manual::${alias}`;
+  if (!parsed && !alias) {
+    throw new Error(`Cannot auto-detect account identity for provider "${provider ?? DEFAULT_PROVIDER}". Provide an alias: cx add <alias>`);
   }
 
-  return withRegistryLock(codexHome, "add", async () => {
-    await ensureAccountsDir(codexHome);
-    const paths = snapshotPaths(codexHome, accountKey);
+  return withRegistryLock(codexHome, "add", () => registerAccount(codexHome, {
+    parsed,
+    alias,
+    provider,
+    authText,
+    configText
+  }));
+}
 
-    // Snapshots hold OAuth tokens or API keys: keep them private to the owner.
-    if (authText !== null) {
-      await writeFileAtomically(paths.auth, authText);
+// Writes the snapshots and the registry entry. Callers must hold the cx lock.
+async function registerAccount(codexHome, { parsed, alias, provider, authText, configText }) {
+  const accountKey = parsed ? parsed.accountKey : `manual::${alias}`;
+  const email = parsed?.email ?? null;
+  const authMode = parsed?.authMode ?? "manual";
+
+  await ensureAccountsDir(codexHome);
+  const paths = snapshotPaths(codexHome, accountKey);
+
+  // Snapshots hold OAuth tokens or API keys: keep them private to the owner.
+  if (authText !== null) {
+    await writeFileAtomically(paths.auth, authText);
+  }
+  if (configText !== null) {
+    await writeFileAtomically(paths.config, configText);
+  }
+
+  const registry = await readRegistry(codexHome);
+  const existingIndex = registry.accounts.findIndex(
+    (account) => account.account_key === accountKey
+  );
+
+  const now = Math.floor(Date.now() / 1000);
+  const accountEntry = {
+    account_key: accountKey,
+    chatgpt_account_id: parsed?.accountId ?? null,
+    chatgpt_user_id: parsed?.userId ?? null,
+    email,
+    alias: alias ?? "",
+    account_name: null,
+    plan: null,
+    auth_mode: authMode,
+    provider: provider ?? null,
+    created_at: now,
+    last_used_at: now,
+    last_usage: null,
+    last_usage_at: null,
+    last_local_rollout: null
+  };
+
+  if (existingIndex >= 0) {
+    const existing = registry.accounts[existingIndex];
+    accountEntry.created_at = existing.created_at ?? now;
+    accountEntry.alias = alias ?? existing.alias ?? "";
+    accountEntry.email = email ?? existing.email ?? null;
+    accountEntry.plan = existing.plan;
+    accountEntry.account_name = existing.account_name;
+    accountEntry.last_usage = existing.last_usage;
+    accountEntry.last_usage_at = existing.last_usage_at;
+    accountEntry.last_local_rollout = existing.last_local_rollout;
+    registry.accounts[existingIndex] = accountEntry;
+  } else {
+    registry.accounts.push(accountEntry);
+  }
+
+  registry.active_account_key = accountKey;
+  registry.active_account_activated_at_ms = Date.now();
+  await writeRegistry(codexHome, registry);
+
+  return { accountKey, email: accountEntry.email, alias: accountEntry.alias, provider };
+}
+
+// True when the outgoing credentials can be restored later, because an account
+// snapshot holds exactly this auth.json.
+async function isAuthSnapshotted(codexHome, authText) {
+  const accountsDir = resolveAccountsDir(codexHome);
+  let entries;
+  try {
+    entries = await fs.readdir(accountsDir);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
     }
-    if (configText !== null) {
-      await writeFileAtomically(paths.config, configText);
+    throw error;
+  }
+
+  for (const entry of entries) {
+    if (entry.endsWith(AUTH_SNAPSHOT_SUFFIX)
+      && await readTextIfExists(path.join(accountsDir, entry)) === authText) {
+      return true;
     }
+  }
+  return false;
+}
 
-    const registry = await readRegistry(codexHome);
-    const existingIndex = registry.accounts.findIndex(
-      (account) => account.account_key === accountKey
-    );
+// Third-party accounts and API keys have no browser login: what is in ~/.codex
+// is the account, so adding one snapshots it. An unsaved login of that kind must
+// be added before signing in, because the sign-in would replace it.
+export async function addNeedsLogin(codexHome) {
+  if ((await readProviderFromConfig(codexHome) ?? DEFAULT_PROVIDER) !== DEFAULT_PROVIDER) {
+    return false;
+  }
+  const authText = await readTextIfExists(resolveAuthPath(codexHome));
+  return authText === null
+    || parseAuthText(authText) !== null
+    || await isAuthSnapshotted(codexHome, authText);
+}
 
-    const now = Math.floor(Date.now() / 1000);
-    const accountEntry = {
-      account_key: accountKey,
-      chatgpt_account_id: parsed?.accountId ?? null,
-      chatgpt_user_id: parsed?.userId ?? null,
-      email,
-      alias: alias ?? "",
-      account_name: null,
-      plan: null,
-      auth_mode: authMode,
-      provider: provider ?? null,
-      created_at: now,
-      last_used_at: now,
-      last_usage: null,
-      last_usage_at: null,
-      last_local_rollout: null
-    };
+// Saves the current login, then removes auth.json so Codex starts its own
+// sign-in. Removing the file matters: `codex login` and `codex logout` revoke
+// any tokens they find, which would invalidate the snapshot just saved.
+export async function addAccountWithLogin(codexHome, alias, { runCodex, onCurrentSaved }) {
+  const authPath = resolveAuthPath(codexHome);
+  const previousAuthText = await readTextIfExists(authPath);
+  onCurrentSaved?.(parseAuthText(previousAuthText) ? await addAccount(codexHome) : null);
 
-    if (existingIndex >= 0) {
-      const existing = registry.accounts[existingIndex];
-      accountEntry.created_at = existing.created_at ?? now;
-      accountEntry.alias = alias ?? existing.alias ?? "";
-      accountEntry.email = email ?? existing.email ?? null;
-      accountEntry.plan = existing.plan;
-      accountEntry.account_name = existing.account_name;
-      accountEntry.last_usage = existing.last_usage;
-      accountEntry.last_usage_at = existing.last_usage_at;
-      accountEntry.last_local_rollout = existing.last_local_rollout;
-      registry.accounts[existingIndex] = accountEntry;
-    } else {
-      registry.accounts.push(accountEntry);
-    }
+  await fs.rm(authPath, { force: true });
 
-    registry.active_account_key = accountKey;
-    registry.active_account_activated_at_ms = Date.now();
-    await writeRegistry(codexHome, registry);
-
-    return { accountKey, email: accountEntry.email, alias: accountEntry.alias, provider };
+  // Codex stays open after signing in, so its exit code says nothing about the
+  // login; what it left in ~/.codex does.
+  let runError = null;
+  await runCodex().catch((error) => {
+    runError = error;
   });
+
+  const signedIn = await readTextIfExists(authPath) !== null || !await addNeedsLogin(codexHome);
+  if (!signedIn) {
+    if (previousAuthText !== null) {
+      await writeFileAtomically(authPath, previousAuthText);
+    }
+    throw runError ?? new Error("No login was completed, so no account was added.");
+  }
+
+  const parsed = parseAuthText(await readTextIfExists(authPath));
+  const accounts = await listAccounts(codexHome);
+  const alreadyRegistered = accounts.some((account) => account.account_key === parsed?.accountKey);
+  return { ...await addAccount(codexHome, alias), alreadyRegistered };
+}
+
+// A login that never reached the registry, such as one from an interrupted
+// `cx add`, has no snapshot: replacing auth.json would lose it.
+async function registerLiveLogin(codexHome) {
+  const authText = await readTextIfExists(resolveAuthPath(codexHome));
+  const configText = await readTextIfExists(resolveConfigPath(codexHome));
+  const provider = configText === null ? null : readCurrentProviderFromConfigText(configText).provider;
+  const parsed = (provider ?? DEFAULT_PROVIDER) === DEFAULT_PROVIDER ? parseAuthText(authText) : null;
+  if (!parsed) {
+    return;
+  }
+
+  const { accounts } = await readRegistry(codexHome);
+  if (!accounts.some((account) => account.account_key === parsed.accountKey)) {
+    await registerAccount(codexHome, { parsed, provider, authText, configText });
+  }
 }
 
 // Callers must hold the cx lock (runSwitch does).
@@ -499,6 +590,7 @@ export async function useAccount(codexHome, identifier) {
     throw new Error("Missing account identifier. Provide an email, alias, or account key.");
   }
 
+  await registerLiveLogin(codexHome);
   const registry = await readRegistry(codexHome);
   const matches = findAccountsByIdentifier(registry.accounts, identifier);
   const match = matches[0];

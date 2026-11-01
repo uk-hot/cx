@@ -44,14 +44,42 @@ glance whether everything is aligned.
 
 ### `cx add [alias]`
 
-Snapshots the current `~/.codex/auth.json` and `config.toml` into
-`~/.codex/accounts/` and registers the account. For ChatGPT/OAuth logins the
-identity (email, account id) is auto-detected from `auth.json`; for other logins
-provide an `alias`:
+Signs in to another account through Codex's own sign-in screen and registers it:
+
+1. Saves the currently logged-in account, so it stays usable.
+2. Removes `~/.codex/auth.json`, so Codex starts its sign-in.
+3. Opens Codex, where you choose how to sign in: ChatGPT, device code, or API key.
+4. Registers the new login when you exit Codex.
 
 ```bash
-cx add work
+cx add            # identity (email, account id) is auto-detected
+cx add work       # also gives the new account an alias
 ```
+
+Close Codex before running `cx add`. If you exit Codex without signing in, the
+previous login is restored. Signing in to a registered account refreshes its
+credentials instead of adding a duplicate, which also recovers an expired login.
+If the browser opens an account that is already signed in, use a private window.
+
+An API key or another login without an email needs the alias: pass it to
+`cx add`, or run `cx add <alias>` after Codex exits. If `cx add` is interrupted
+after signing in, the login stays active and `cx switch` registers it first.
+
+> **Do not run `codex login` or `codex logout` directly while `~/.codex` holds an
+> account you want to keep.** Both revoke its tokens on OpenAI's side, which also
+> invalidates the snapshot `cx` saved. `cx add` removes `auth.json` first to
+> avoid this.
+
+Third-party providers have no sign-in screen, so `cx add <alias>` snapshots them
+from `~/.codex` instead of opening Codex. To add one, configure it in Codex first:
+
+```bash
+cx add gateway
+```
+
+An API key that isn't saved yet would be replaced by a sign-in, so `cx add`
+without an alias stops and asks for one. Once it is saved, `cx add` signs in as
+usual.
 
 ### `cx switch <email|alias>`
 
@@ -113,6 +141,15 @@ closing Codex to sync them.
 - Close Codex and the Codex app before switching if files are reported as locked.
 
 ## Changelog
+
+### Unreleased
+
+- `cx add` now signs in to a new account: it saves the current one, removes
+  `auth.json` so its tokens aren't revoked, opens Codex to sign in, and registers
+  the result on exit. Third-party providers and unsaved API keys are still
+  snapshotted with `cx add <alias>`.
+- `cx switch` registers a login that has no snapshot before replacing it.
+- Removed the deprecated `cx save`.
 
 ### 0.2.8
 

@@ -209,3 +209,37 @@ test("syncing the active account keeps a known email when the token has none", a
   assert.equal(registry.active_account_key, "user-1::account-1");
   assert.equal(registry.accounts[0].email, "user@example.com");
 });
+
+test("switch registers a login that has no snapshot before replacing it", async (t) => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), "cx-auth-unregistered-"));
+  t.after(() => fs.rm(codexHome, { recursive: true, force: true }));
+
+  const accountsDir = path.join(codexHome, "accounts");
+  await fs.mkdir(accountsDir);
+
+  const targetKey = "user-1::account-1";
+  const targetAuth = oauthAuth({ userId: "user-1", accountId: "account-1", refreshToken: "target-token" });
+  const liveAuth = oauthAuth({ userId: "user-2", accountId: "account-2", refreshToken: "live-token" });
+  await writeJson(path.join(accountsDir, accountKeyToFilename(targetKey)), targetAuth);
+  await writeJson(path.join(codexHome, "auth.json"), liveAuth);
+  await writeJson(path.join(accountsDir, "registry.json"), {
+    schema_version: 3,
+    active_account_key: targetKey,
+    accounts: [{ account_key: targetKey, email: "target@example.com", alias: "target" }]
+  });
+
+  await useAccount(codexHome, "target");
+
+  const liveSnapshot = await fs.readFile(
+    path.join(accountsDir, accountKeyToFilename("user-2::account-2")),
+    "utf8"
+  );
+  assert.equal(JSON.parse(liveSnapshot).tokens.refresh_token, "live-token");
+
+  const registry = JSON.parse(await fs.readFile(path.join(accountsDir, "registry.json"), "utf8"));
+  assert.deepEqual(
+    registry.accounts.map((account) => account.account_key),
+    [targetKey, "user-2::account-2"]
+  );
+  assert.equal(registry.active_account_key, targetKey);
+});

@@ -35,19 +35,3 @@ test("add registers a manual account", async (t) => {
   assert.equal(registry.accounts[0].account_key, "manual::third-party");
 
 });
-
-test("save still works as a deprecated alias of add", async (t) => {
-  const home = await fs.mkdtemp(path.join(os.tmpdir(), "cx-cli-save-"));
-  t.after(() => fs.rm(home, { recursive: true, force: true }));
-
-  const codexHome = path.join(home, ".codex");
-  await fs.mkdir(codexHome);
-  await fs.writeFile(path.join(codexHome, "config.toml"), "model_provider = \"third-party\"\n", "utf8");
-
-  const { stdout, stderr } = await execFileAsync(process.execPath, [cliPath, "save", "third-party"], {
-    env: { ...process.env, HOME: home },
-    encoding: "utf8"
-  });
-  assert.match(stdout, /^Added account:/);
-  assert.match(stderr, /deprecated/);
-});
