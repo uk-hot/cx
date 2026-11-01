@@ -18,6 +18,7 @@ import {
 import { restartCodexDaemon } from "./codex-daemon.js";
 import { runCodexForLogin } from "./codex-login.js";
 import { defaultCodexHome } from "./constants.js";
+import { getAccountUsage, renderUsage } from "./usage-service.js";
 
 function resolveHome() {
   return defaultCodexHome();
@@ -262,7 +263,12 @@ async function main() {
     assertNoExtraPositionals(positionals, 1, "cx status");
     await syncActiveAccountFromCurrentAuth(resolveHome());
     const { getStatus, renderStatus } = await loadServiceModule();
-    const status = await getStatus({ codexHome: resolveHome() });
+    const [usage, status] = await Promise.all([
+      getAccountUsage(resolveHome()),
+      getStatus({ codexHome: resolveHome() })
+    ]);
+    console.log(renderUsage(usage));
+    console.log("");
     console.log(renderStatus(status));
     return;
   }

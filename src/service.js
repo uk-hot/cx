@@ -25,7 +25,7 @@ import {
   readSqliteProviderCounts,
   updateSqliteProvider
 } from "./sqlite-state.js";
-import { ANSI, colorEnabled, colorize, padCell } from "./terminal-ui.js";
+import { ANSI, buildTable, colorEnabled, colorize } from "./terminal-ui.js";
 
 function normalizeCodexHome(explicitCodexHome) {
   return path.resolve(explicitCodexHome ?? defaultCodexHome());
@@ -120,38 +120,6 @@ function formatRestoreFailures(failures) {
   return failures
     .map((failure) => `${failure.path}: ${failure.message}`)
     .join("; ");
-}
-
-function buildTable(headers, rows, options = {}) {
-  const enabled = colorEnabled();
-  const widths = headers.map((header) => header.length);
-
-  for (const row of rows) {
-    row.forEach((cell, index) => {
-      widths[index] = Math.max(widths[index], String(cell).length);
-    });
-  }
-
-  const border = `+${widths.map((width) => "-".repeat(width + 2)).join("+")}+`;
-  const renderRow = (cells, styleFn = null) => {
-    const rendered = cells.map((cell, index) => {
-      const raw = padCell(String(cell), widths[index]);
-      return styleFn ? colorize(raw, styleFn(index, String(cell)), enabled) : raw;
-    });
-    return `| ${rendered.join(" | ")} |`;
-  };
-
-  const lines = [
-    colorize(border, ANSI.dim, enabled),
-    colorize(renderRow(headers), ANSI.dim, enabled),
-    colorize(border, ANSI.dim, enabled)
-  ];
-
-  for (const row of rows) {
-    lines.push(renderRow(row, options.cellColor));
-  }
-  lines.push(colorize(border, ANSI.dim, enabled));
-  return lines.join("\n");
 }
 
 function buildCountRows(countsByScope) {
