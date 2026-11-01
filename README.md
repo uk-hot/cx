@@ -38,8 +38,13 @@ cx remove <email|alias>
 
 ### `cx status`
 
-Shows the live 5-hour and weekly quota left on every registered OpenAI account
-signed in with ChatGPT, with the active one marked `*`:
+Shows the current provider (from `~/.codex/config.toml`) and the per-provider
+counts found in your rollout files and in the SQLite state, so you can see at a
+glance whether everything is aligned.
+
+Below that, printed last because it needs the network, is the live 5-hour and
+weekly quota left on every registered account signed in with ChatGPT. The account
+Codex is logged in to is marked `*`:
 
 ```text
 ACCOUNT USAGE
@@ -51,20 +56,24 @@ ACCOUNT USAGE
 +---------------------+------+------------------------+-------------------------+
 ```
 
-API-key logins and third-party providers have no such limits and are left out.
-An account that cannot be read shows why, and the others are still listed:
+API-key logins and third-party providers have no such limits and are left out. A
+plan without a limit shows `-`, and a limit of any other length gets an
+`OTHER LIMITS` column. An account that cannot be read shows why, and the others
+are still listed:
 
 - `sign-in expired`: its saved access token has expired. `cx status` never
   refreshes tokens, because a refresh token is single-use and refreshing one here
   could sign out a running Codex. `cx switch` to the account and use Codex to
   renew it.
-- `no saved login`: its snapshot is missing or belongs to another account.
-- `timed out`, `unreachable`, `HTTP <code>`, `unexpected response`: the usage
-  request failed.
+- `no saved login`: its snapshot is missing, malformed or belongs to another
+  account.
+- `timed out`, `unreachable`, `HTTP <code>`: the usage request failed.
+- `unexpected response`: the usage endpoint answered in a format `cx` doesn't
+  know.
 
-Below that it shows the current provider (from `~/.codex/config.toml`) and the
-per-provider counts found in your rollout files and in the SQLite state, so you
-can see at a glance whether everything is aligned.
+The request honours `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`. It doesn't use
+the macOS or Windows system proxy, so set those variables if chatgpt.com is only
+reachable through one.
 
 ### `cx add [alias]`
 
@@ -191,9 +200,9 @@ closing Codex to sync them.
 
 - `cx` reads and writes only under `~/.codex`.
 - `cx status` sends each OpenAI account's access token to
-  `https://chatgpt.com/backend-api/wham/usage`, the undocumented endpoint behind
-  Codex's own usage display, which may change without notice. No other command
-  contacts a usage API, and nothing is cached or written.
+  `https://chatgpt.com/backend-api/wham/usage`, an undocumented endpoint that
+  Codex calls too and that may change without notice. No other command contacts
+  a usage API, and the result is not cached or written anywhere.
 - `cx add` copies your `auth.json` (OAuth tokens or API keys) and `config.toml`
   into `~/.codex/accounts/`, readable by the owner only. Treat that directory as
   sensitive.
@@ -203,8 +212,10 @@ closing Codex to sync them.
 
 ### Unreleased
 
-- `cx status` leads with the live 5-hour and weekly quota left on every OpenAI
-  account signed in with ChatGPT.
+- `cx status` shows the live 5-hour and weekly quota left on every account signed
+  in with ChatGPT, after the local status.
+- Accounts with neither an email nor an alias are shown by their key instead of a
+  blank name.
 
 ### 0.2.10
 

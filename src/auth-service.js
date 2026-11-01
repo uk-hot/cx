@@ -75,6 +75,9 @@ export async function writeRegistry(codexHome, registry) {
 }
 
 function decodeJwtPayload(token) {
+  if (typeof token !== "string") {
+    return null;
+  }
   const parts = token.split(".");
   if (parts.length < 2) {
     return null;
@@ -316,6 +319,11 @@ export function findAccountsByIdentifier(accounts, identifier) {
   }
 
   return accounts.filter((account) => fuzzyAccountMatch(account, needle));
+}
+
+// An unset alias is an empty string, and a login without an id_token has no email.
+export function accountDisplayName(account) {
+  return account.email || account.alias || account.account_key;
 }
 
 export async function listAccounts(codexHome) {
@@ -644,7 +652,7 @@ export async function useAccount(codexHome, identifier) {
   const hasConfigSnapshot = await fileExists(paths.config);
 
   if (!hasAuthSnapshot && !hasConfigSnapshot) {
-    throw new Error(`No snapshot files found for "${match.email ?? match.alias ?? match.account_key}". Re-add the account.`);
+    throw new Error(`No snapshot files found for "${accountDisplayName(match)}". Re-add the account.`);
   }
 
   // Codex refreshes OAuth tokens in auth.json while it is running. Preserve

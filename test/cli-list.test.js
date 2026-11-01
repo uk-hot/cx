@@ -46,6 +46,15 @@ test("list shows only the registered accounts", async (t) => {
   assert.doesNotMatch(stdout, /Providers:|providers,/);
 });
 
+test("list names an account without an email or alias by its key", async (t) => {
+  const home = await makeHome(t, [
+    { account_key: "u1::a1", email: null, alias: "", provider: "openai" }
+  ], null);
+
+  const { stdout } = await runCli(home, ["list"]);
+  assert.match(stdout, /u1::a1\s+openai/);
+});
+
 test("list with no accounts", async (t) => {
   const home = await makeHome(t, null, null);
   const { stdout } = await runCli(home, ["list"]);
