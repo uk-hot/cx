@@ -149,7 +149,7 @@ closing Codex to sync them.
 
 ## Changelog
 
-### Unreleased
+### 0.2.9
 
 - `cx add` now signs in to a new account: it saves the current one, removes
   `auth.json` so its tokens aren't revoked, opens Codex to sign in, and registers
