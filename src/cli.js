@@ -4,6 +4,7 @@ import { createInterface } from "node:readline/promises";
 import process from "node:process";
 
 import {
+  accountDisplayName,
   findAccountsByIdentifier,
   getCurrentAccount,
   isExactAccountMatch,
@@ -18,7 +19,7 @@ import {
 import { restartCodexDaemon } from "./codex-daemon.js";
 import { runCodexForLogin } from "./codex-login.js";
 import { defaultCodexHome } from "./constants.js";
-import { getAccountUsage, renderUsage } from "./usage-service.js";
+import { renderAccountUsage } from "./usage-service.js";
 
 function resolveHome() {
   return defaultCodexHome();
@@ -148,20 +149,18 @@ async function resyncSkippedRollouts(switchResult) {
 }
 
 function accountLabel(account) {
-  const primary = account.email ?? account.alias ?? account.account_key;
   const providerSuffix = account.provider ? ` [${account.provider}]` : "";
-  return `${primary}${providerSuffix}`;
+  return `${accountDisplayName(account)}${providerSuffix}`;
 }
 
 function renderRegisteredAccounts(accounts, activeKey) {
-  const labelOf = (account) => account.email ?? account.alias ?? account.account_key;
-  const labelWidth = Math.max(...accounts.map((account) => labelOf(account).length), 0);
+  const labelWidth = Math.max(...accounts.map((account) => accountDisplayName(account).length), 0);
 
   const lines = [`Registered accounts (${accounts.length}):`];
   for (const account of accounts) {
     const isActive = account.account_key === activeKey;
     const provider = account.provider ?? "-";
-    lines.push(`${isActive ? "*" : " "} ${labelOf(account).padEnd(labelWidth)}  ${provider}${isActive ? "  (active)" : ""}`);
+    lines.push(`${isActive ? "*" : " "} ${accountDisplayName(account).padEnd(labelWidth)}  ${provider}${isActive ? "  (active)" : ""}`);
   }
 
   return lines.join("\n");
@@ -232,6 +231,24 @@ async function loadServiceModule() {
   return import("./service.js");
 }
 
+// Usage comes last because it can wait on the network, and the local status
+// shouldn't. A local failure still shows the usage, which needs no SQLite.
+async function printStatus(codexHome) {
+  let localError = null;
+  try {
+    await syncActiveAccountFromCurrentAuth(codexHome);
+    const { getStatus, renderStatus } = await loadServiceModule();
+    console.log(renderStatus(await getStatus({ codexHome })));
+    console.log("");
+  } catch (error) {
+    localError = error;
+  }
+  console.log(await renderAccountUsage(codexHome));
+  if (localError) {
+    throw localError;
+  }
+}
+
 async function main() {
   const { positionals, flags } = parseArgs(process.argv.slice(2));
   const command = positionals[0];
@@ -261,15 +278,7 @@ async function main() {
 
   if (command === "status") {
     assertNoExtraPositionals(positionals, 1, "cx status");
-    await syncActiveAccountFromCurrentAuth(resolveHome());
-    const { getStatus, renderStatus } = await loadServiceModule();
-    const [usage, status] = await Promise.all([
-      getAccountUsage(resolveHome()),
-      getStatus({ codexHome: resolveHome() })
-    ]);
-    console.log(renderUsage(usage));
-    console.log("");
-    console.log(renderStatus(status));
+    await printStatus(resolveHome());
     return;
   }
 
@@ -284,7 +293,7 @@ async function main() {
       useAccountFn: useAccount
     });
     const acct = result.switchedAccount;
-    const label = acct?.email ?? acct?.alias ?? identifier;
+    const label = acct?.email || acct?.alias || identifier;
     console.log(`Switched account: ${label}${acct?.provider ? ` [${acct.provider}]` : ""}`);
     console.log(summarizeSync(result, "Synchronized"));
     if (await restartDaemonForNewLogin() && result.skippedLockedRolloutFiles?.length) {

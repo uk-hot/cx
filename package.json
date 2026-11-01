@@ -32,6 +32,7 @@
     "url": "https://github.com/uk-hot/cx/issues"
   },
   "dependencies": {
-    "better-sqlite3": "^12.8.0"
+    "better-sqlite3": "^12.8.0",
+    "undici": "^7.30.1"
   }
 }
