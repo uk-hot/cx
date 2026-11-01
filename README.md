@@ -114,6 +114,11 @@ closing Codex to sync them.
 
 ## Changelog
 
+### 0.2.8
+
+- Ship `src/cli.js` as executable again; with 0.2.7 a global install failed
+  with "Permission denied" when running `cx`.
+
 ### 0.2.7
 
 0.2.6 was tagged on GitHub but never published to npm; its changes are
