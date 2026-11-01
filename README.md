@@ -88,6 +88,10 @@ the saved `config.toml`, then synchronizes the `model_provider` metadata of all
 rollout files and SQLite rows to the switched account's provider. If the account
 can't be identified uniquely, you'll be prompted to choose (in a TTY).
 
+A ChatGPT login that isn't registered yet is registered before it is replaced.
+An API key that isn't saved can't be recovered once replaced, so `cx switch`
+stops and asks you to save it with `cx add <alias>` first.
+
 Only these `config.toml` settings belong to an account: `model_provider`,
 `model`, `model_reasoning_effort`, `model_reasoning_summary`, `model_verbosity`,
 `model_context_window`, `model_auto_compact_token_limit`, `service_tier`,
@@ -107,6 +111,9 @@ and only writes the registry to record the account currently logged in to
 
 Removes a registered account and its snapshot files from the registry. An
 identifier that only partially matches an account must be confirmed in a TTY.
+Removing the account Codex is logged in to leaves `auth.json` as it is, so Codex
+stays signed in, but neither `cx switch` nor `cx add` registers that login
+again. To add it back, sign in to it with `cx add`.
 
 ## How it works
 
@@ -148,7 +155,10 @@ closing Codex to sync them.
   `auth.json` so its tokens aren't revoked, opens Codex to sign in, and registers
   the result on exit. Third-party providers and unsaved API keys are still
   snapshotted with `cx add <alias>`.
-- `cx switch` registers a login that has no snapshot before replacing it.
+- `cx switch` registers a login that has no snapshot before replacing it, and
+  refuses to replace an unsaved API key.
+- An account removed while Codex is logged in to it stays removed: `cx switch`
+  and `cx add` no longer register it again.
 - Removed the deprecated `cx save`.
 
 ### 0.2.8

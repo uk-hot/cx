@@ -460,6 +460,12 @@ async function registerAccount(codexHome, { parsed, alias, provider, authText, c
     (account) => account.account_key === accountKey
   );
 
+  // A ChatGPT login registered from auth.json is the live login now, and adding
+  // the removed account back is deliberate: either way the removal is over.
+  if (parsed || accountKey === registry.removed_account_key) {
+    delete registry.removed_account_key;
+  }
+
   const now = Math.floor(Date.now() / 1000);
   const accountEntry = {
     account_key: accountKey,
@@ -523,6 +529,18 @@ async function isAuthSnapshotted(codexHome, authText) {
   return false;
 }
 
+// An API key or other non-OAuth login of the OpenAI provider exists only in
+// auth.json until a snapshot holds it, so replacing auth.json would lose it.
+async function hasUnsavedNonOAuthLogin(codexHome) {
+  if ((await readProviderFromConfig(codexHome) ?? DEFAULT_PROVIDER) !== DEFAULT_PROVIDER) {
+    return false;
+  }
+  const authText = await readTextIfExists(resolveAuthPath(codexHome));
+  return authText !== null
+    && parseAuthText(authText) === null
+    && !await isAuthSnapshotted(codexHome, authText);
+}
+
 // Third-party accounts and API keys have no browser login: what is in ~/.codex
 // is the account, so adding one snapshots it. An unsaved login of that kind must
 // be added before signing in, because the sign-in would replace it.
@@ -530,10 +548,7 @@ export async function addNeedsLogin(codexHome) {
   if ((await readProviderFromConfig(codexHome) ?? DEFAULT_PROVIDER) !== DEFAULT_PROVIDER) {
     return false;
   }
-  const authText = await readTextIfExists(resolveAuthPath(codexHome));
-  return authText === null
-    || parseAuthText(authText) !== null
-    || await isAuthSnapshotted(codexHome, authText);
+  return !await hasUnsavedNonOAuthLogin(codexHome);
 }
 
 // Saves the current login, then removes auth.json so Codex starts its own
@@ -542,7 +557,10 @@ export async function addNeedsLogin(codexHome) {
 export async function addAccountWithLogin(codexHome, alias, { runCodex, onCurrentSaved }) {
   const authPath = resolveAuthPath(codexHome);
   const previousAuthText = await readTextIfExists(authPath);
-  onCurrentSaved?.(parseAuthText(previousAuthText) ? await addAccount(codexHome) : null);
+  const previous = parseAuthText(previousAuthText);
+  const { removed_account_key: removedAccountKey } = await readRegistry(codexHome);
+  const saveCurrent = previous !== null && previous.accountKey !== removedAccountKey;
+  onCurrentSaved?.(saveCurrent ? await addAccount(codexHome) : null);
 
   await fs.rm(authPath, { force: true });
 
@@ -568,7 +586,8 @@ export async function addAccountWithLogin(codexHome, alias, { runCodex, onCurren
 }
 
 // A login that never reached the registry, such as one from an interrupted
-// `cx add`, has no snapshot: replacing auth.json would lose it.
+// `cx add`, has no snapshot: replacing auth.json would lose it. A login removed
+// with `cx remove` is left out.
 async function registerLiveLogin(codexHome) {
   const authText = await readTextIfExists(resolveAuthPath(codexHome));
   const configText = await readTextIfExists(resolveConfigPath(codexHome));
@@ -578,8 +597,9 @@ async function registerLiveLogin(codexHome) {
     return;
   }
 
-  const { accounts } = await readRegistry(codexHome);
-  if (!accounts.some((account) => account.account_key === parsed.accountKey)) {
+  const { accounts, removed_account_key: removedAccountKey } = await readRegistry(codexHome);
+  if (parsed.accountKey !== removedAccountKey
+    && !accounts.some((account) => account.account_key === parsed.accountKey)) {
     await registerAccount(codexHome, { parsed, provider, authText, configText });
   }
 }
@@ -590,6 +610,9 @@ export async function useAccount(codexHome, identifier) {
     throw new Error("Missing account identifier. Provide an email, alias, or account key.");
   }
 
+  if (await hasUnsavedNonOAuthLogin(codexHome)) {
+    throw new Error("The current login (an API key or other non-ChatGPT login) is not saved and switching would replace it. Save it first: cx add <alias>");
+  }
   await registerLiveLogin(codexHome);
   const registry = await readRegistry(codexHome);
   const matches = findAccountsByIdentifier(registry.accounts, identifier);
@@ -643,6 +666,8 @@ export async function useAccount(codexHome, identifier) {
   match.last_used_at = Math.floor(Date.now() / 1000);
   registry.active_account_key = match.account_key;
   registry.active_account_activated_at_ms = Date.now();
+  // auth.json no longer holds the removed account's login.
+  delete registry.removed_account_key;
   await writeRegistry(codexHome, registry);
 
   return {
@@ -677,7 +702,14 @@ export async function removeAccount(codexHome, identifier) {
     await fs.rm(paths.auth, { force: true });
     await fs.rm(paths.config, { force: true });
 
-    if (registry.active_account_key === removed.account_key) {
+    // Codex may still be logged in to the removed account. Remember it, so that
+    // neither `cx switch` nor `cx add` registers that login again on its own.
+    const live = parseAuthText(await readTextIfExists(resolveAuthPath(codexHome)));
+    if (live?.accountKey === removed.account_key) {
+      registry.removed_account_key = removed.account_key;
+    }
+
+    if (registry.active_account_key === removed.account_key || live?.accountKey === removed.account_key) {
       registry.active_account_key = null;
       registry.active_account_activated_at_ms = null;
     }

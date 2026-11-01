@@ -8,6 +8,7 @@ import {
   accountKeyToConfigFilename,
   accountKeyToFilename,
   addAccount,
+  removeAccount,
   syncActiveAccountFromCurrentAuth,
   useAccount
 } from "../src/auth-service.js";
@@ -242,4 +243,56 @@ test("switch registers a login that has no snapshot before replacing it", async 
     [targetKey, "user-2::account-2"]
   );
   assert.equal(registry.active_account_key, targetKey);
+});
+
+async function setupTwoLogins(t, prefix) {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  t.after(() => fs.rm(codexHome, { recursive: true, force: true }));
+
+  const authPath = path.join(codexHome, "auth.json");
+  await writeJson(authPath, oauthAuth({ userId: "user-1", accountId: "account-1", refreshToken: "token-1" }));
+  await addAccount(codexHome, "one");
+  await writeJson(authPath, oauthAuth({ userId: "user-2", accountId: "account-2", refreshToken: "token-2" }));
+  await addAccount(codexHome, "two");
+
+  const readRegistry = async () => JSON.parse(
+    await fs.readFile(path.join(codexHome, "accounts", "registry.json"), "utf8")
+  );
+  return { codexHome, authPath, readRegistry };
+}
+
+test("switch does not bring back the logged-in account after it was removed", async (t) => {
+  const { codexHome, readRegistry } = await setupTwoLogins(t, "cx-auth-remove-active-");
+
+  await removeAccount(codexHome, "two");
+  await useAccount(codexHome, "one");
+
+  const registry = await readRegistry();
+  assert.deepEqual(registry.accounts.map((account) => account.account_key), ["user-1::account-1"]);
+  assert.equal(registry.active_account_key, "user-1::account-1");
+});
+
+test("removing the logged-in account clears the active account even when another one is recorded", async (t) => {
+  const { codexHome, readRegistry } = await setupTwoLogins(t, "cx-auth-remove-live-");
+  const registryPath = path.join(codexHome, "accounts", "registry.json");
+  await writeJson(registryPath, { ...await readRegistry(), active_account_key: "user-1::account-1" });
+
+  await removeAccount(codexHome, "two");
+  assert.equal((await readRegistry()).active_account_key, null);
+
+  await useAccount(codexHome, "one");
+  assert.deepEqual((await readRegistry()).accounts.map((account) => account.account_key), ["user-1::account-1"]);
+});
+
+test("switch refuses to replace an API-key login that is not saved", async (t) => {
+  const { codexHome, authPath } = await setupTwoLogins(t, "cx-auth-unsaved-key-");
+  const apiKeyAuth = JSON.stringify({ auth_mode: "apikey", OPENAI_API_KEY: "sk-test" });
+  await fs.writeFile(authPath, apiKeyAuth, "utf8");
+
+  await assert.rejects(useAccount(codexHome, "one"), /not saved.*cx add <alias>/);
+  assert.equal(await fs.readFile(authPath, "utf8"), apiKeyAuth);
+
+  await addAccount(codexHome, "key");
+  await useAccount(codexHome, "one");
+  assert.equal(JSON.parse(await fs.readFile(authPath, "utf8")).tokens.refresh_token, "token-1");
 });

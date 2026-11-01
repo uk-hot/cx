@@ -267,3 +267,49 @@ test("a third-party provider never starts Codex", { skip }, async (t) => {
   assert.equal((await ctx.readRegistry()).accounts[0].account_key, "manual::gateway");
   assert.equal(await ctx.readAuth(), oauthAuth("old"));
 });
+
+// Registers "old" and "new", then removes "new" while Codex is still logged in to it.
+async function setupRemovedLiveLogin(t) {
+  const ctx = await setup(t);
+  await fs.writeFile(ctx.authPath, oauthAuth("old"));
+  await fs.writeFile(ctx.loginAuthPath, oauthAuth("new"));
+  await ctx.run(["add"]);
+  await ctx.run(["remove", "new@example.com"]);
+  await fs.rm(path.join(ctx.fakeDir, "args"));
+  return ctx;
+}
+
+const accountEmails = async (ctx) => (await ctx.readRegistry()).accounts.map((account) => account.email);
+
+test("add does not save a removed account that is still logged in", { skip }, async (t) => {
+  const ctx = await setupRemovedLiveLogin(t);
+  await fs.writeFile(ctx.loginAuthPath, oauthAuth("other"));
+
+  const { stdout } = await ctx.run(["add"]);
+  assert.doesNotMatch(stdout, /Saved current account/);
+  assert.match(stdout, /^Added account: other@example\.com$/m);
+  assert.deepEqual(await accountEmails(ctx), ["old@example.com", "other@example.com"]);
+});
+
+test("a cancelled add leaves a removed account out of the next switch", { skip }, async (t) => {
+  const ctx = await setupRemovedLiveLogin(t);
+  await fs.rm(ctx.loginAuthPath);
+
+  await assert.rejects(ctx.run(["add"]), /No login was completed/);
+  assert.equal(await ctx.readAuth(), oauthAuth("new"));
+
+  await fs.writeFile(path.join(ctx.codexHome, "config.toml"), "model = \"gpt\"\n");
+  await ctx.run(["switch", "old@example.com"]);
+  assert.equal(await ctx.readAuth(), oauthAuth("old"));
+  assert.deepEqual(await accountEmails(ctx), ["old@example.com"]);
+});
+
+test("signing in to a removed account adds it back", { skip }, async (t) => {
+  const ctx = await setupRemovedLiveLogin(t);
+
+  const { stdout } = await ctx.run(["add"]);
+  assert.match(stdout, /^Added account: new@example\.com$/m);
+  const registry = await ctx.readRegistry();
+  assert.deepEqual(registry.accounts.map((account) => account.email), ["old@example.com", "new@example.com"]);
+  assert.equal(registry.removed_account_key, undefined);
+});
