@@ -260,22 +260,29 @@ async function runSyncLocked({
   const appliedPathSet = new Set(applyResult.appliedPaths);
   const appliedSessionChanges = writableChanges.filter((change) => appliedPathSet.has(change.path));
 
+  const skippedLockedRolloutFiles = [...new Set([
+    ...skippedRolloutFiles,
+    ...applyResult.skippedPaths
+  ])].sort((left, right) => left.localeCompare(right));
+  const changeByPath = new Map(changes.map((change) => [change.path, change]));
+  const skippedThreadIds = skippedLockedRolloutFiles
+    .map((filePath) => changeByPath.get(filePath)?.threadId)
+    .filter(Boolean);
+
   // 2) Update SQLite in a short transaction. On failure, roll the rewritten
   //    rollout files back so both stores stay consistent.
   let sqliteResult;
   try {
     sqliteResult = await updateSqliteProvider(codexHome, targetProvider, {
-      busyTimeoutMs: sqliteBusyTimeoutMs
+      busyTimeoutMs: sqliteBusyTimeoutMs,
+      skippedThreadIds,
+      skippedRolloutPaths: skippedLockedRolloutFiles
     });
   } catch (error) {
     await restoreAppliedOrThrow(appliedSessionChanges, error);
     throw error;
   }
 
-  const skippedLockedRolloutFiles = [...new Set([
-    ...skippedRolloutFiles,
-    ...applyResult.skippedPaths
-  ])].sort((left, right) => left.localeCompare(right));
   return {
     codexHome,
     targetProvider,

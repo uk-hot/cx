@@ -55,53 +55,88 @@ cx add work
 
 ### `cx switch <email|alias>`
 
-Restores a registered account's `auth.json`/`config.toml`, then synchronizes the
-`model_provider` metadata of all rollout files and SQLite rows to the switched
-account's provider. If the account can't be identified uniquely, you'll be
-prompted to choose (in a TTY).
+Restores a registered account's `auth.json` and its provider/model settings from
+the saved `config.toml`, then synchronizes the `model_provider` metadata of all
+rollout files and SQLite rows to the switched account's provider. If the account
+can't be identified uniquely, you'll be prompted to choose (in a TTY).
+
+Only these `config.toml` settings belong to an account: `model_provider`,
+`model`, `model_reasoning_effort`, `model_reasoning_summary`, `model_verbosity`,
+`model_context_window`, `model_auto_compact_token_limit`, `service_tier`,
+`profile`, the login/base-URL keys, and the `[model_providers.*]` and
+`[profiles.*]` tables. Everything else — trusted projects, MCP servers, approval
+and sandbox settings, TUI state — is kept from the live config, so changes made
+after `cx add` survive a switch.
 
 ### `cx list`
 
 Lists the accounts registered in the registry (email/alias and provider), marking the
-active one with `*`. It is read-only and offline — it does not contact any
-provider/usage API.
+active one with `*`. It is offline — it does not contact any provider/usage API —
+and only writes the registry to record the account currently logged in to
+`auth.json`.
 
 ### `cx remove <email|alias>`
 
-Removes a registered account and its snapshot files from the registry.
+Removes a registered account and its snapshot files from the registry. An
+identifier that only partially matches an account must be confirmed in a TTY.
 
 ## How it works
 
 On a `switch` (and its underlying sync), `cx`:
 
 1. Acquires a lock under `~/.codex/tmp/` so two runs can't interfere.
-2. Persists the current account's latest OAuth credentials before replacing
-   `auth.json`, preserving token refreshes made by Codex since `cx add`.
+2. Persists the current account's latest OAuth credentials and provider/model
+   settings before replacing them, preserving token refreshes made by Codex and
+   settings changed since `cx add`.
 3. Scans `sessions/` and `archived_sessions/` for `rollout-*.jsonl` files and
    collects those whose `session_meta` first line has a different provider.
-4. Verifies the SQLite database is writable, then **rewrites the rollout files
+4. Skips rollout files another process still has open (a running Codex session
+   would otherwise keep appending to the replaced file and lose those events).
+5. Verifies the SQLite database is writable, then **rewrites the rollout files
    first** (outside any DB transaction) and **updates SQLite in a short
    transaction** — keeping the database lock brief regardless of file count.
-5. If the SQLite update fails, the already-rewritten rollout files are rolled
-   back byte-for-byte, so the two stores never diverge.
+   Rows of skipped rollout files keep their provider.
+6. If the SQLite update fails, the already-rewritten rollout files are rolled
+   back, so the two stores do not diverge.
 
-On Windows, rollout files are opened exclusively and rewritten via a single
-batched PowerShell pass; files locked by a running Codex are skipped and
-reported rather than corrupted.
+Open files are detected via `/proc` on Linux, `lsof` on macOS, and an exclusive
+open on Windows, where rollouts are rewritten via a single batched PowerShell
+pass. Skipped files are reported rather than corrupted; re-run `cx switch` after
+closing Codex to sync them.
 
 ## Data & safety
 
 - `cx` reads and writes only under `~/.codex`.
-- `cx add` copies your `auth.json` (which contains OAuth tokens) into
-  `~/.codex/accounts/`. Treat that directory as sensitive.
+- `cx add` copies your `auth.json` (OAuth tokens or API keys) and `config.toml`
+  into `~/.codex/accounts/`, readable by the owner only. Treat that directory as
+  sensitive.
 - Close Codex and the Codex app before switching if files are reported as locked.
 
 ## Changelog
 
-### 0.2.6
+### 0.2.7
 
-- Preserve OAuth token refreshes before switching accounts, so returning to a
-  ChatGPT account does not restore stale credentials and require another login.
+0.2.6 was tagged on GitHub but never published to npm; its changes are
+included here.
+
+- `cx switch` no longer replaces the whole `config.toml` with the snapshot from
+  `cx add`; only provider/model settings are per account, so trusted projects
+  and MCP servers added later are kept.
+- Preserve OAuth token refreshes and provider/model settings before switching
+  accounts, so returning to an account does not restore stale state.
+- Skip rollout files that a running Codex still has open on Linux and macOS
+  (previously only on Windows), and keep rewritten rollouts' file mode.
+- The SQLite update leaves threads of skipped rollout files unchanged.
+- Read `model_provider` written with single quotes, with a trailing comment, or
+  from the active `profile`; these were treated as the default `openai`.
+- `cx add <alias>` with a third-party provider registers a manual account even
+  if `auth.json` still holds ChatGPT tokens.
+- Snapshots and the registry are written atomically with owner-only permissions;
+  registry updates take the `cx` lock; a lock left without an owner file is
+  recovered after a minute.
+- Snapshot file names use base64url, so no account key can produce a `/`.
+- `cx remove` asks for confirmation when the identifier only partially matches.
+- `cx save` was renamed to `cx add`; `cx save` still works as a deprecated alias.
 - Hold the `cx` lock across the complete account switch and provider sync.
 
 ### 0.2.5

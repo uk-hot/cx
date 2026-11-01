@@ -3,6 +3,12 @@ import path from "node:path";
 
 import { DEFAULT_LOCK_NAME } from "./constants.js";
 
+export const LOCK_BUSY_CODE = "CX_LOCK_BUSY";
+
+// A lock directory without owner.json is left by a run that died between
+// mkdir and writing the owner file; treat it as stale once it is this old.
+const OWNERLESS_LOCK_STALE_MS = 60 * 1000;
+
 function lockDirPath(codexHome) {
   return path.join(codexHome, "tmp", DEFAULT_LOCK_NAME);
 }
@@ -44,9 +50,25 @@ function formatExistingLockMessage(lockDir, owner) {
   return `Lock already exists at ${lockDir}. Close Codex/App and retry, or remove the stale lock if you are sure no sync is running.`;
 }
 
+async function isOwnerlessLockStale(lockDir) {
+  try {
+    const stat = await fs.stat(lockDir);
+    return Date.now() - stat.mtimeMs > OWNERLESS_LOCK_STALE_MS;
+  } catch {
+    return true;
+  }
+}
+
+function lockBusyError(lockDir, owner) {
+  const error = new Error(formatExistingLockMessage(lockDir, owner));
+  error.code = LOCK_BUSY_CODE;
+  return error;
+}
+
 async function recoverStaleLock(lockDir) {
   const owner = await readLockOwner(lockDir);
-  if (!owner || isProcessRunning(owner.pid)) {
+  const stale = owner ? !isProcessRunning(owner.pid) : await isOwnerlessLockStale(lockDir);
+  if (!stale) {
     return {
       recovered: false,
       owner
@@ -69,13 +91,13 @@ export async function acquireLock(codexHome, label = "codex-provider-sync") {
     if (error && error.code === "EEXIST") {
       const stale = await recoverStaleLock(lockDir);
       if (!stale.recovered) {
-        throw new Error(formatExistingLockMessage(lockDir, stale.owner));
+        throw lockBusyError(lockDir, stale.owner);
       }
       try {
         await fs.mkdir(lockDir);
       } catch (retryError) {
         if (retryError && retryError.code === "EEXIST") {
-          throw new Error(formatExistingLockMessage(lockDir, await readLockOwner(lockDir)));
+          throw lockBusyError(lockDir, await readLockOwner(lockDir));
         }
         throw retryError;
       }

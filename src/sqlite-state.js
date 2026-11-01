@@ -109,12 +109,21 @@ export async function updateSqliteProvider(codexHome, targetProvider, options = 
     setBusyTimeout(db, options.busyTimeoutMs);
     db.exec("BEGIN IMMEDIATE");
     transactionOpen = true;
+    // Threads whose rollout file was skipped (locked or changed) keep their
+    // provider, so the rollout file and its row stay in agreement.
     const stmt = db.prepare(`
       UPDATE threads
       SET model_provider = ?
       WHERE COALESCE(model_provider, '') <> ?
+        AND id NOT IN (SELECT value FROM json_each(?))
+        AND rollout_path NOT IN (SELECT value FROM json_each(?))
     `);
-    const result = stmt.run(targetProvider, targetProvider);
+    const result = stmt.run(
+      targetProvider,
+      targetProvider,
+      JSON.stringify(options.skippedThreadIds ?? []),
+      JSON.stringify(options.skippedRolloutPaths ?? [])
+    );
     db.exec("COMMIT");
     transactionOpen = false;
     return { updatedRows: result.changes ?? 0, databasePresent: true };

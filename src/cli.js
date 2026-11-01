@@ -6,6 +6,7 @@ import process from "node:process";
 import {
   findAccountsByIdentifier,
   getCurrentAccount,
+  isExactAccountMatch,
   listAccounts,
   removeAccount,
   addAccount,
@@ -71,6 +72,7 @@ function validateFlags(command, flags) {
     status: new Set(),
     switch: new Set(["account"]),
     add: new Set(["alias"]),
+    save: new Set(["alias"]),
     list: new Set(),
     remove: new Set(["account"])
   };
@@ -133,11 +135,18 @@ async function resolveAccountIdentifier(codexHome, identifier, action) {
 
   const accounts = await listAccounts(codexHome);
   const matches = findAccountsByIdentifier(accounts, identifier);
-  if (matches.length <= 1) {
+  // Removing deletes the saved credentials, so a partial match must be confirmed.
+  const confirmPartialRemove = action === "remove"
+    && matches.length === 1
+    && !isExactAccountMatch(matches[0], identifier);
+  if (matches.length <= 1 && !confirmPartialRemove) {
     return identifier;
   }
 
   if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    if (confirmPartialRemove) {
+      throw new Error(`"${identifier}" only partially matches ${accountLabel(matches[0])}. Use the exact email or alias, or re-run in a TTY to confirm.`);
+    }
     throw new Error(`Multiple registered accounts match "${identifier}". Re-run in a TTY to choose one.`);
   }
 
@@ -147,22 +156,25 @@ async function resolveAccountIdentifier(codexHome, identifier, action) {
   });
 
   try {
-    console.log(`Multiple accounts match "${identifier}":`);
-    matches.forEach((account, index) => {
-      console.log(`  ${index + 1}. ${accountLabel(account)}`);
-    });
+    let selected = matches[0];
+    if (matches.length > 1) {
+      console.log(`Multiple accounts match "${identifier}":`);
+      matches.forEach((account, index) => {
+        console.log(`  ${index + 1}. ${accountLabel(account)}`);
+      });
 
-    const selection = (await rl.question(`Select account to ${action} [1-${matches.length}] (or q to cancel): `)).trim();
-    if (!selection || /^q$/i.test(selection)) {
-      throw new Error(`${action === "remove" ? "Remove" : "Switch"} cancelled.`);
+      const selection = (await rl.question(`Select account to ${action} [1-${matches.length}] (or q to cancel): `)).trim();
+      if (!selection || /^q$/i.test(selection)) {
+        throw new Error(`${action === "remove" ? "Remove" : "Switch"} cancelled.`);
+      }
+
+      const selectedIndex = Number.parseInt(selection, 10);
+      if (!Number.isInteger(selectedIndex) || selectedIndex < 1 || selectedIndex > matches.length) {
+        throw new Error(`Invalid selection. Enter a number from 1 to ${matches.length}.`);
+      }
+
+      selected = matches[selectedIndex - 1];
     }
-
-    const selectedIndex = Number.parseInt(selection, 10);
-    if (!Number.isInteger(selectedIndex) || selectedIndex < 1 || selectedIndex > matches.length) {
-      throw new Error(`Invalid selection. Enter a number from 1 to ${matches.length}.`);
-    }
-
-    const selected = matches[selectedIndex - 1];
     const confirmPrompt = action === "remove"
       ? `Remove ${accountLabel(selected)}? [y/N] `
       : `Switch to ${accountLabel(selected)}? [y/N] `;
@@ -234,7 +246,10 @@ async function main() {
     return;
   }
 
-  if (command === "add") {
+  if (command === "add" || command === "save") {
+    if (command === "save") {
+      console.error("`cx save` is deprecated; use `cx add` instead.");
+    }
     assertNoExtraPositionals(positionals, 2, "cx add [alias]");
     const alias = positionals[1] ?? flags.alias;
     const result = await addAccount(resolveHome(), alias);

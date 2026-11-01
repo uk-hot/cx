@@ -31,7 +31,8 @@ async function getFileSnapshot(filePath) {
   const stat = await fsp.stat(filePath);
   return {
     size: stat.size,
-    mtimeMs: stat.mtimeMs
+    mtimeMs: stat.mtimeMs,
+    mode: stat.mode & 0o777
   };
 }
 
@@ -109,9 +110,10 @@ function parseSessionMetaRecord(firstLine) {
 }
 
 async function rewriteFirstLine(filePath, nextFirstLine, separator) {
+  const { mode } = await getFileSnapshot(filePath);
   const current = await readFirstLineRecord(filePath);
   const tmpPath = `${filePath}.provider-sync.${process.pid}.${Date.now()}.tmp`;
-  const writer = fs.createWriteStream(tmpPath, { encoding: "utf8" });
+  const writer = fs.createWriteStream(tmpPath, { encoding: "utf8", mode: 0o600 });
 
   try {
     await new Promise((resolve, reject) => {
@@ -138,6 +140,7 @@ async function rewriteFirstLine(filePath, nextFirstLine, separator) {
       reader.pipe(writer, { end: false });
     });
 
+    await fsp.chmod(tmpPath, mode);
     await fsp.rename(tmpPath, filePath);
   } catch (error) {
     await fsp.rm(tmpPath, { force: true });
@@ -157,7 +160,7 @@ async function tryRewriteCollectedFirstLine(change) {
   }
 
   const tmpPath = `${change.path}.provider-sync.${process.pid}.${Date.now()}.tmp`;
-  const writer = fs.createWriteStream(tmpPath, { encoding: "utf8" });
+  const writer = fs.createWriteStream(tmpPath, { encoding: "utf8", mode: 0o600 });
 
   try {
     await new Promise((resolve, reject) => {
@@ -187,6 +190,7 @@ async function tryRewriteCollectedFirstLine(change) {
       return false;
     }
 
+    await fsp.chmod(tmpPath, beforeSnapshot.mode);
     await fsp.rename(tmpPath, change.path);
     return true;
   } catch (error) {
@@ -235,6 +239,86 @@ async function findLockedFilesOnWindows(filePaths) {
   } finally {
     await fsp.rm(tempDir, { recursive: true, force: true });
   }
+}
+
+async function realpathMap(filePaths) {
+  const byRealPath = new Map();
+  for (const filePath of filePaths) {
+    byRealPath.set(await fsp.realpath(filePath).catch(() => filePath), filePath);
+  }
+  return byRealPath;
+}
+
+// Linux: a rollout is in use when any process holds a descriptor to it.
+async function findOpenFilesOnLinux(filePaths) {
+  const byRealPath = await realpathMap(filePaths);
+  const openPaths = new Set();
+  const pids = (await fsp.readdir("/proc")).filter((name) => /^\d+$/.test(name));
+  for (const pid of pids) {
+    let descriptors;
+    try {
+      descriptors = await fsp.readdir(`/proc/${pid}/fd`);
+    } catch {
+      continue;
+    }
+    for (const descriptor of descriptors) {
+      let target;
+      try {
+        target = await fsp.readlink(`/proc/${pid}/fd/${descriptor}`);
+      } catch {
+        continue;
+      }
+      const filePath = byRealPath.get(target);
+      if (filePath) {
+        openPaths.add(filePath);
+      }
+    }
+  }
+  return [...openPaths];
+}
+
+// macOS and other POSIX systems without /proc: ask lsof.
+async function findOpenFilesWithLsof(filePaths) {
+  const byRealPath = await realpathMap(filePaths);
+  const openPaths = new Set();
+  const realPaths = [...byRealPath.keys()];
+  for (let start = 0; start < realPaths.length; start += 200) {
+    let stdout;
+    try {
+      ({ stdout } = await execFileAsync("lsof", ["-Fn", "--", ...realPaths.slice(start, start + 200)], {
+        maxBuffer: 16 * 1024 * 1024
+      }));
+    } catch (error) {
+      // lsof exits 1 when some of the listed files are not open.
+      if (typeof error?.code !== "number") {
+        throw new Error(`Unable to verify whether rollout files are in use (lsof). ${error.message}`);
+      }
+      stdout = error.stdout ?? "";
+    }
+    for (const line of stdout.split(/\r?\n/)) {
+      const filePath = line.startsWith("n") ? byRealPath.get(line.slice(1)) : null;
+      if (filePath) {
+        openPaths.add(filePath);
+      }
+    }
+  }
+  return [...openPaths];
+}
+
+// Rewrites replace the rollout file, so a running Codex that still has it open
+// would keep appending to the replaced file and lose those events. Report such
+// files as locked on every platform.
+async function findOpenRolloutFiles(filePaths) {
+  if (!filePaths.length) {
+    return [];
+  }
+  if (process.platform === "win32") {
+    return findLockedFilesOnWindows(filePaths);
+  }
+  if (process.platform === "linux") {
+    return findOpenFilesOnLinux(filePaths);
+  }
+  return findOpenFilesWithLsof(filePaths);
 }
 
 export async function collectSessionChanges(codexHome, targetProvider, options = {}) {
@@ -557,11 +641,11 @@ export async function applySessionChanges(changes) {
 }
 
 export async function assertSessionFilesWritable(changes) {
-  if (!changes?.length || process.platform !== "win32") {
+  if (!changes?.length) {
     return;
   }
 
-  const lockedPaths = await findLockedFilesOnWindows(changes.map((change) => change.path));
+  const lockedPaths = await findOpenRolloutFiles(changes.map((change) => change.path));
   if (lockedPaths.length === 0) {
     return;
   }
@@ -575,14 +659,14 @@ export async function assertSessionFilesWritable(changes) {
 }
 
 export async function splitLockedSessionChanges(changes) {
-  if (!changes?.length || process.platform !== "win32") {
+  if (!changes?.length) {
     return {
       writableChanges: changes ?? [],
       lockedChanges: []
     };
   }
 
-  const lockedPaths = new Set(await findLockedFilesOnWindows(changes.map((change) => change.path)));
+  const lockedPaths = new Set(await findOpenRolloutFiles(changes.map((change) => change.path)));
   if (lockedPaths.size === 0) {
     return {
       writableChanges: changes,

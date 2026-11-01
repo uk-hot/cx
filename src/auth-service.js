@@ -5,10 +5,15 @@ import path from "node:path";
 import {
   ACCOUNTS_DIR_NAME,
   AUTH_FILE_NAME,
+  DEFAULT_PROVIDER,
   REGISTRY_FILE_NAME,
   REGISTRY_SCHEMA_VERSION,
 } from "./constants.js";
-import { readCurrentProviderFromConfigText } from "./config-file.js";
+import { mergeAccountConfigText, readCurrentProviderFromConfigText } from "./config-file.js";
+import { LOCK_BUSY_CODE, acquireLock } from "./locking.js";
+
+const AUTH_SNAPSHOT_SUFFIX = ".auth.json";
+const CONFIG_SNAPSHOT_SUFFIX = ".config.toml";
 
 export function resolveAccountsDir(codexHome) {
   return path.join(codexHome, ACCOUNTS_DIR_NAME);
@@ -58,11 +63,15 @@ export async function readRegistry(codexHome) {
   }
 }
 
-export async function writeRegistry(codexHome, registry) {
+async function ensureAccountsDir(codexHome) {
   const dir = resolveAccountsDir(codexHome);
-  await fs.mkdir(dir, { recursive: true });
-  const filePath = registryPath(codexHome);
-  await fs.writeFile(filePath, JSON.stringify(registry, null, 2), "utf8");
+  await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  return dir;
+}
+
+export async function writeRegistry(codexHome, registry) {
+  await ensureAccountsDir(codexHome);
+  await writeFileAtomically(registryPath(codexHome), JSON.stringify(registry, null, 2));
 }
 
 function decodeJwtPayload(token) {
@@ -80,6 +89,11 @@ function decodeJwtPayload(token) {
 
 export function parseAuthFile(authData) {
   if (!authData?.tokens) {
+    return null;
+  }
+  // An API-key login may still carry tokens from an earlier ChatGPT login;
+  // those do not identify the account that is actually in use.
+  if (String(authData.auth_mode ?? "").toLowerCase() === "apikey") {
     return null;
   }
   const { tokens } = authData;
@@ -115,12 +129,17 @@ export function parseAuthFile(authData) {
   };
 }
 
+// Snapshot names use base64url so a key can never produce a "/" in the name.
+function encodeAccountKey(accountKey) {
+  return Buffer.from(accountKey, "utf8").toString("base64url");
+}
+
 export function accountKeyToFilename(accountKey) {
-  return `${Buffer.from(accountKey, "utf8").toString("base64").replace(/=+$/, "")}.auth.json`;
+  return `${encodeAccountKey(accountKey)}${AUTH_SNAPSHOT_SUFFIX}`;
 }
 
 export function accountKeyToConfigFilename(accountKey) {
-  return `${Buffer.from(accountKey, "utf8").toString("base64").replace(/=+$/, "")}.config.toml`;
+  return `${encodeAccountKey(accountKey)}${CONFIG_SNAPSHOT_SUFFIX}`;
 }
 
 export function filenameToAccountKey(filename) {
@@ -129,6 +148,7 @@ export function filenameToAccountKey(filename) {
     return null;
   }
   try {
+    // Node's base64 decoder accepts both the standard and the url-safe alphabet.
     return Buffer.from(match[1], "base64").toString("utf8");
   } catch {
     return null;
@@ -144,14 +164,51 @@ async function fileExists(filePath) {
   }
 }
 
-async function writeFileAtomically(filePath, text) {
+async function readTextIfExists(filePath) {
+  try {
+    return await fs.readFile(filePath, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function fileModeOr(filePath, fallbackMode) {
+  try {
+    return (await fs.stat(filePath)).mode & 0o777;
+  } catch {
+    return fallbackMode;
+  }
+}
+
+async function writeFileAtomically(filePath, text, { mode = 0o600 } = {}) {
   const temporaryPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   try {
-    await fs.writeFile(temporaryPath, text, { encoding: "utf8", mode: 0o600 });
+    await fs.writeFile(temporaryPath, text, { encoding: "utf8", mode });
+    await fs.chmod(temporaryPath, mode);
     await fs.rename(temporaryPath, filePath);
   } catch (error) {
     await fs.rm(temporaryPath, { force: true }).catch(() => {});
     throw error;
+  }
+}
+
+function snapshotPaths(codexHome, accountKey) {
+  const accountsDir = resolveAccountsDir(codexHome);
+  return {
+    auth: path.join(accountsDir, accountKeyToFilename(accountKey)),
+    config: path.join(accountsDir, accountKeyToConfigFilename(accountKey))
+  };
+}
+
+async function withRegistryLock(codexHome, label, fn) {
+  const releaseLock = await acquireLock(codexHome, label);
+  try {
+    return await fn();
+  } finally {
+    await releaseLock();
   }
 }
 
@@ -178,11 +235,35 @@ async function persistCurrentOAuthSnapshot(codexHome, registry) {
     return false;
   }
 
-  const snapshotPath = path.join(
-    resolveAccountsDir(codexHome),
-    accountKeyToFilename(currentAccount.account_key)
+  await writeFileAtomically(snapshotPaths(codexHome, currentAccount.account_key).auth, authText);
+  return true;
+}
+
+// Saves the live config.toml back into the active account's snapshot, so model
+// or provider settings changed while that account was active survive a switch
+// away and back.
+async function persistCurrentConfigSnapshot(codexHome, registry) {
+  const currentAccount = registry.accounts.find(
+    (account) => account.account_key === registry.active_account_key
   );
-  await writeFileAtomically(snapshotPath, authText);
+  if (!currentAccount) {
+    return false;
+  }
+
+  const snapshotPath = snapshotPaths(codexHome, currentAccount.account_key).config;
+  const liveText = await readTextIfExists(resolveConfigPath(codexHome));
+  const snapshotText = await readTextIfExists(snapshotPath);
+  if (liveText === null || snapshotText === null) {
+    return false;
+  }
+
+  // A config that was pointed at another provider by hand does not belong to
+  // this account; never overwrite the account's snapshot with it.
+  if (readCurrentProviderFromConfigText(liveText).provider !== readCurrentProviderFromConfigText(snapshotText).provider) {
+    return false;
+  }
+
+  await writeFileAtomically(snapshotPath, liveText);
   return true;
 }
 
@@ -205,6 +286,10 @@ function exactAccountMatch(account, identifier, needle) {
 function fuzzyAccountMatch(account, needle) {
   return account.email?.toLowerCase().includes(needle)
     || account.alias?.toLowerCase().includes(needle);
+}
+
+export function isExactAccountMatch(account, identifier) {
+  return Boolean(identifier) && exactAccountMatch(account, identifier, identifier.toLowerCase());
 }
 
 export function findAccountsByIdentifier(accounts, identifier) {
@@ -251,68 +336,88 @@ export async function syncActiveAccountFromCurrentAuth(codexHome) {
     return false;
   }
 
-  const registry = await readRegistry(codexHome);
-  const match = registry.accounts.find((account) => account.account_key === parsed.accountKey);
-  if (!match) {
-    return false;
+  // This refresh is opportunistic: if another cx run holds the lock, skip it
+  // rather than racing that run's registry write.
+  let releaseLock;
+  try {
+    releaseLock = await acquireLock(codexHome, "sync-active");
+  } catch (error) {
+    if (error?.code === LOCK_BUSY_CODE) {
+      return false;
+    }
+    throw error;
   }
 
-  let changed = false;
-  if (registry.active_account_key !== parsed.accountKey) {
-    registry.active_account_key = parsed.accountKey;
-    registry.active_account_activated_at_ms = Date.now();
-    changed = true;
-  }
+  try {
+    const registry = await readRegistry(codexHome);
+    const match = registry.accounts.find((account) => account.account_key === parsed.accountKey);
+    if (!match) {
+      return false;
+    }
 
-  if (match.email !== parsed.email) {
-    match.email = parsed.email;
-    changed = true;
-  }
-  if (match.chatgpt_account_id !== parsed.accountId) {
-    match.chatgpt_account_id = parsed.accountId;
-    changed = true;
-  }
-  if (match.chatgpt_user_id !== parsed.userId) {
-    match.chatgpt_user_id = parsed.userId;
-    changed = true;
-  }
-  if (match.auth_mode !== parsed.authMode) {
-    match.auth_mode = parsed.authMode;
-    changed = true;
-  }
+    let changed = false;
+    if (registry.active_account_key !== parsed.accountKey) {
+      registry.active_account_key = parsed.accountKey;
+      registry.active_account_activated_at_ms = Date.now();
+      changed = true;
+    }
 
-  if (!changed) {
-    return false;
-  }
+    // Only the id_token carries the email; keep the known one when it is absent.
+    if (parsed.email && match.email !== parsed.email) {
+      match.email = parsed.email;
+      changed = true;
+    }
+    if (match.chatgpt_account_id !== parsed.accountId) {
+      match.chatgpt_account_id = parsed.accountId;
+      changed = true;
+    }
+    if (match.chatgpt_user_id !== parsed.userId) {
+      match.chatgpt_user_id = parsed.userId;
+      changed = true;
+    }
+    if (match.auth_mode !== parsed.authMode) {
+      match.auth_mode = parsed.authMode;
+      changed = true;
+    }
 
-  match.last_used_at = Math.floor(Date.now() / 1000);
-  await writeRegistry(codexHome, registry);
-  return true;
+    if (!changed) {
+      return false;
+    }
+
+    match.last_used_at = Math.floor(Date.now() / 1000);
+    await writeRegistry(codexHome, registry);
+    return true;
+  } finally {
+    await releaseLock();
+  }
 }
 
 export async function addAccount(codexHome, alias) {
-  const accountsDir = resolveAccountsDir(codexHome);
-  await fs.mkdir(accountsDir, { recursive: true });
-
   const authPath = resolveAuthPath(codexHome);
   const configPath = resolveConfigPath(codexHome);
 
-  const authExists = await fileExists(authPath);
-  const configExists = await fileExists(configPath);
+  const authText = await readTextIfExists(authPath);
+  const configText = await readTextIfExists(configPath);
 
-  if (!authExists && !configExists) {
+  if (authText === null && configText === null) {
     throw new Error(`Neither auth.json nor config.toml found in ${codexHome}. Nothing to add.`);
   }
 
+  const provider = configText === null ? null : readCurrentProviderFromConfigText(configText).provider;
+
   let parsed = null;
-  if (authExists) {
+  if (authText !== null) {
     try {
-      const authText = await fs.readFile(authPath, "utf8");
-      const authData = JSON.parse(authText);
-      parsed = parseAuthFile(authData);
+      parsed = parseAuthFile(JSON.parse(authText));
     } catch {
       // auth.json exists but is not OpenAI OAuth format — that's fine for third-party
     }
+  }
+  // ChatGPT tokens left in auth.json only identify the account when Codex is
+  // actually using the OpenAI provider; otherwise this is a third-party login
+  // and must not overwrite the ChatGPT account's registration.
+  if (parsed && (provider ?? DEFAULT_PROVIDER) !== DEFAULT_PROVIDER) {
+    parsed = null;
   }
 
   let accountKey;
@@ -325,67 +430,70 @@ export async function addAccount(codexHome, alias) {
     authMode = parsed.authMode;
   } else {
     if (!alias) {
-      throw new Error("Cannot auto-detect account identity. Provide an alias: cx add <alias>");
+      throw new Error(`Cannot auto-detect account identity for provider "${provider ?? DEFAULT_PROVIDER}". Provide an alias: cx add <alias>`);
     }
     accountKey = `manual::${alias}`;
   }
 
-  if (authExists) {
-    const snapshotFilename = accountKeyToFilename(accountKey);
-    await fs.copyFile(authPath, path.join(accountsDir, snapshotFilename));
-  }
+  return withRegistryLock(codexHome, "add", async () => {
+    await ensureAccountsDir(codexHome);
+    const paths = snapshotPaths(codexHome, accountKey);
 
-  if (configExists) {
-    const configSnapshotFilename = accountKeyToConfigFilename(accountKey);
-    await fs.copyFile(configPath, path.join(accountsDir, configSnapshotFilename));
-  }
+    // Snapshots hold OAuth tokens or API keys: keep them private to the owner.
+    if (authText !== null) {
+      await writeFileAtomically(paths.auth, authText);
+    }
+    if (configText !== null) {
+      await writeFileAtomically(paths.config, configText);
+    }
 
-  const provider = await readProviderFromConfig(codexHome);
+    const registry = await readRegistry(codexHome);
+    const existingIndex = registry.accounts.findIndex(
+      (account) => account.account_key === accountKey
+    );
 
-  const registry = await readRegistry(codexHome);
-  const existingIndex = registry.accounts.findIndex(
-    (account) => account.account_key === accountKey
-  );
+    const now = Math.floor(Date.now() / 1000);
+    const accountEntry = {
+      account_key: accountKey,
+      chatgpt_account_id: parsed?.accountId ?? null,
+      chatgpt_user_id: parsed?.userId ?? null,
+      email,
+      alias: alias ?? "",
+      account_name: null,
+      plan: null,
+      auth_mode: authMode,
+      provider: provider ?? null,
+      created_at: now,
+      last_used_at: now,
+      last_usage: null,
+      last_usage_at: null,
+      last_local_rollout: null
+    };
 
-  const now = Math.floor(Date.now() / 1000);
-  const accountEntry = {
-    account_key: accountKey,
-    chatgpt_account_id: parsed?.accountId ?? null,
-    chatgpt_user_id: parsed?.userId ?? null,
-    email,
-    alias: alias ?? "",
-    account_name: null,
-    plan: null,
-    auth_mode: authMode,
-    provider: provider ?? null,
-    created_at: now,
-    last_used_at: now,
-    last_usage: null,
-    last_usage_at: null,
-    last_local_rollout: null
-  };
+    if (existingIndex >= 0) {
+      const existing = registry.accounts[existingIndex];
+      accountEntry.created_at = existing.created_at ?? now;
+      accountEntry.alias = alias ?? existing.alias ?? "";
+      accountEntry.email = email ?? existing.email ?? null;
+      accountEntry.plan = existing.plan;
+      accountEntry.account_name = existing.account_name;
+      accountEntry.last_usage = existing.last_usage;
+      accountEntry.last_usage_at = existing.last_usage_at;
+      accountEntry.last_local_rollout = existing.last_local_rollout;
+      registry.accounts[existingIndex] = accountEntry;
+    } else {
+      registry.accounts.push(accountEntry);
+    }
 
-  if (existingIndex >= 0) {
-    const existing = registry.accounts[existingIndex];
-    accountEntry.created_at = existing.created_at ?? now;
-    accountEntry.alias = alias ?? existing.alias ?? "";
-    accountEntry.plan = existing.plan;
-    accountEntry.account_name = existing.account_name;
-    accountEntry.last_usage = existing.last_usage;
-    accountEntry.last_usage_at = existing.last_usage_at;
-    accountEntry.last_local_rollout = existing.last_local_rollout;
-    registry.accounts[existingIndex] = accountEntry;
-  } else {
-    registry.accounts.push(accountEntry);
-  }
+    registry.active_account_key = accountKey;
+    registry.active_account_activated_at_ms = Date.now();
+    await writeRegistry(codexHome, registry);
 
-  registry.active_account_key = accountKey;
-  registry.active_account_activated_at_ms = Date.now();
-  await writeRegistry(codexHome, registry);
-
-  return { accountKey, email, alias: accountEntry.alias, provider };
+    return { accountKey, email: accountEntry.email, alias: accountEntry.alias, provider };
+  });
 }
 
+// Callers must hold the cx lock (runSwitch does).
 export async function useAccount(codexHome, identifier) {
   if (!identifier) {
     throw new Error("Missing account identifier. Provide an email, alias, or account key.");
@@ -402,13 +510,9 @@ export async function useAccount(codexHome, identifier) {
     throw new Error(`Multiple registered accounts match "${identifier}".`);
   }
 
-  const accountsDir = resolveAccountsDir(codexHome);
-
-  const authSnapshotPath = path.join(accountsDir, accountKeyToFilename(match.account_key));
-  const configSnapshotPath = path.join(accountsDir, accountKeyToConfigFilename(match.account_key));
-
-  const hasAuthSnapshot = await fileExists(authSnapshotPath);
-  const hasConfigSnapshot = await fileExists(configSnapshotPath);
+  const paths = snapshotPaths(codexHome, match.account_key);
+  const hasAuthSnapshot = await fileExists(paths.auth);
+  const hasConfigSnapshot = await fileExists(paths.config);
 
   if (!hasAuthSnapshot && !hasConfigSnapshot) {
     throw new Error(`No snapshot files found for "${match.email ?? match.alias ?? match.account_key}". Re-add the account.`);
@@ -417,22 +521,33 @@ export async function useAccount(codexHome, identifier) {
   // Codex refreshes OAuth tokens in auth.json while it is running. Preserve
   // that latest credential set before replacing auth.json with another
   // account, otherwise a later switch restores the stale tokens captured by the
-  // original `cx add`.
+  // original `cx add`. The same applies to the outgoing account's model and
+  // provider settings in config.toml.
   await persistCurrentOAuthSnapshot(codexHome, registry);
+  await persistCurrentConfigSnapshot(codexHome, registry);
 
   const authPath = resolveAuthPath(codexHome);
   const configPath = resolveConfigPath(codexHome);
 
   if (hasAuthSnapshot) {
-    await writeFileAtomically(authPath, await fs.readFile(authSnapshotPath, "utf8"));
+    await writeFileAtomically(authPath, await fs.readFile(paths.auth, "utf8"));
   } else {
     await fs.rm(authPath, { force: true });
   }
 
   if (hasConfigSnapshot) {
-    await fs.copyFile(configSnapshotPath, configPath);
+    // Only provider/model settings are per account. Projects, MCP servers and
+    // other settings added since the snapshot was taken stay as they are.
+    const snapshotText = await fs.readFile(paths.config, "utf8");
+    const liveText = await readTextIfExists(configPath);
+    await writeFileAtomically(
+      configPath,
+      liveText === null ? snapshotText : mergeAccountConfigText(liveText, snapshotText),
+      { mode: await fileModeOr(configPath, 0o600) }
+    );
   }
 
+  match.provider = (await readProviderFromConfig(codexHome)) ?? match.provider;
   match.last_used_at = Math.floor(Date.now() / 1000);
   registry.active_account_key = match.account_key;
   registry.active_account_activated_at_ms = Date.now();
@@ -451,29 +566,31 @@ export async function removeAccount(codexHome, identifier) {
     throw new Error("Missing account identifier.");
   }
 
-  const registry = await readRegistry(codexHome);
-  const matches = findAccountsByIdentifier(registry.accounts, identifier);
-  const match = matches[0];
+  return withRegistryLock(codexHome, "remove", async () => {
+    const registry = await readRegistry(codexHome);
+    const matches = findAccountsByIdentifier(registry.accounts, identifier);
+    const match = matches[0];
 
-  if (!match) {
-    throw new Error(`No registered account matches "${identifier}".`);
-  }
-  if (matches.length > 1) {
-    throw new Error(`Multiple registered accounts match "${identifier}".`);
-  }
+    if (!match) {
+      throw new Error(`No registered account matches "${identifier}".`);
+    }
+    if (matches.length > 1) {
+      throw new Error(`Multiple registered accounts match "${identifier}".`);
+    }
 
-  const index = registry.accounts.findIndex((account) => account.account_key === match.account_key);
-  const removed = registry.accounts.splice(index, 1)[0];
+    const index = registry.accounts.findIndex((account) => account.account_key === match.account_key);
+    const removed = registry.accounts.splice(index, 1)[0];
 
-  const accountsDir = resolveAccountsDir(codexHome);
-  await fs.rm(path.join(accountsDir, accountKeyToFilename(removed.account_key)), { force: true });
-  await fs.rm(path.join(accountsDir, accountKeyToConfigFilename(removed.account_key)), { force: true });
+    const paths = snapshotPaths(codexHome, removed.account_key);
+    await fs.rm(paths.auth, { force: true });
+    await fs.rm(paths.config, { force: true });
 
-  if (registry.active_account_key === removed.account_key) {
-    registry.active_account_key = null;
-    registry.active_account_activated_at_ms = null;
-  }
+    if (registry.active_account_key === removed.account_key) {
+      registry.active_account_key = null;
+      registry.active_account_activated_at_ms = null;
+    }
 
-  await writeRegistry(codexHome, registry);
-  return { accountKey: removed.account_key, email: removed.email };
+    await writeRegistry(codexHome, registry);
+    return { accountKey: removed.account_key, email: removed.email };
+  });
 }
