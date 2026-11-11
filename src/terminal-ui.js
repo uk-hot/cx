@@ -53,3 +53,8 @@ export function buildTable(headers, rows, options = {}) {
   lines.push(colorize(border, ANSI.dim, enabled));
   return lines.join("\n");
 }
+
+// Identifiers are typed into a shell, and an alias may contain spaces.
+export function shellArgument(value) {
+  return /^[\w@.+:=-]+$/.test(value) ? value : `'${value.replaceAll("'", "'\\''")}'`;
+}

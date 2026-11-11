@@ -19,6 +19,7 @@ import {
 import { restartCodexDaemon } from "./codex-daemon.js";
 import { runCodexForLogin } from "./codex-login.js";
 import { defaultCodexHome } from "./constants.js";
+import { shellArgument } from "./terminal-ui.js";
 import { renderAccountUsage } from "./usage-service.js";
 
 function resolveHome() {
@@ -29,12 +30,12 @@ function printHelp() {
   console.log(`cx
 
 Usage:
-  cx status
-  cx switch <email|alias>
-
-  cx add [alias]
-  cx list
-  cx remove <email|alias>
+  cx status                 Show provider sync state and each account's quota
+  cx switch <email|alias>   Switch Codex to a registered account
+  cx add [alias]            Sign in to a new account, or again to a registered
+                            one whose login expired or was signed out
+  cx list                   List registered accounts
+  cx remove <email|alias>   Remove a registered account
 `);
 }
 
@@ -313,8 +314,10 @@ async function main() {
       return;
     }
 
+    let previous = null;
     const result = await addAccountWithLogin(resolveHome(), alias, {
       onCurrentSaved(saved) {
+        previous = saved;
         if (saved) {
           console.log(`Saved current account: ${saved.email ?? saved.accountKey}`);
         }
@@ -327,6 +330,10 @@ async function main() {
       console.log("To add a different account, sign out of auth.openai.com in the browser or use a private window.");
     } else {
       printAddedAccount(result);
+    }
+    // Signing in makes the new login the current one; the saved one is a switch away.
+    if (previous && previous.accountKey !== result.accountKey) {
+      console.log(`Codex now uses this account. To go back: cx switch ${shellArgument(previous.email || previous.alias || previous.accountKey)}`);
     }
     await restartDaemonForNewLogin();
     return;

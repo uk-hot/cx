@@ -94,6 +94,7 @@ test("add saves the current account and signs in through Codex", { skip }, async
   const { stdout } = await ctx.run(["add", "work"]);
   assert.match(stdout, /^Saved current account: old@example\.com$/m);
   assert.match(stdout, /^Added account: new@example\.com \(alias: work\)$/m);
+  assert.match(stdout, /^Codex now uses this account\. To go back: cx switch old@example\.com$/m);
 
   assert.equal((await fs.readFile(path.join(ctx.fakeDir, "args"), "utf8")).trim(), "--no-daemon");
   assert.equal((await fs.readFile(path.join(ctx.fakeDir, "codex-home"), "utf8")).trim(), ctx.codexHome);
@@ -235,6 +236,7 @@ test("signing in to the same account refreshes it without adding a duplicate", {
   const { stdout } = await ctx.run(["add"]);
   assert.match(stdout, /^Refreshed already registered account: old@example\.com$/m);
   assert.doesNotMatch(stdout, /^Added account/m);
+  assert.doesNotMatch(stdout, /To go back/);
   assert.equal((await ctx.readRegistry()).accounts.length, 1);
   assert.deepEqual(await ctx.readSnapshots(), [refreshed]);
 });

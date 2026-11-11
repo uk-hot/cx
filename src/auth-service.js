@@ -74,7 +74,7 @@ export async function writeRegistry(codexHome, registry) {
   await writeFileAtomically(registryPath(codexHome), JSON.stringify(registry, null, 2));
 }
 
-function decodeJwtPayload(token) {
+export function decodeJwtPayload(token) {
   if (typeof token !== "string") {
     return null;
   }

@@ -4,13 +4,14 @@ import path from "node:path";
 import {
   accountDisplayName,
   accountKeyToFilename,
+  decodeJwtPayload,
   parseAuthFile,
   readRegistry,
   resolveAccountsDir,
   resolveAuthPath
 } from "./auth-service.js";
 import { DEFAULT_PROVIDER } from "./constants.js";
-import { ANSI, buildTable, colorEnabled, colorize } from "./terminal-ui.js";
+import { ANSI, buildTable, colorEnabled, colorize, shellArgument } from "./terminal-ui.js";
 
 const USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage";
 const USAGE_TIMEOUT_MS = 8000;
@@ -20,6 +21,9 @@ const LOW_QUOTA_PERCENT = 30;
 const CRITICAL_QUOTA_PERCENT = 10;
 const FIVE_HOUR_COLUMN = 2;
 const WEEKLY_COLUMN = 3;
+const SIGN_IN_EXPIRED = "sign-in expired";
+const SIGNED_OUT = "signed out";
+const NO_SAVED_LOGIN = "no saved login";
 
 // Usage limits exist only for ChatGPT sign-ins to OpenAI itself: API keys and
 // third-party providers have none.
@@ -40,9 +44,11 @@ async function readAuthData(filePath) {
 function credentialsFor(account, authData) {
   const parsed = parseAuthFile(authData);
   const accessToken = authData?.tokens?.access_token;
-  return parsed?.accountKey === account.account_key && typeof accessToken === "string"
-    ? { accessToken, accountId: parsed.accountId }
-    : null;
+  if (parsed?.accountKey !== account.account_key || typeof accessToken !== "string") {
+    return null;
+  }
+  const exp = decodeJwtPayload(accessToken)?.exp;
+  return { accessToken, accountId: parsed.accountId, expiresAt: Number.isFinite(exp) ? exp : null };
 }
 
 function toQuota(window) {
@@ -87,7 +93,16 @@ function parseUsageBody(body) {
   };
 }
 
-async function fetchUsage(credentials, fetchFn) {
+// A token rejected before it expires was revoked (by `codex logout`, a sign-in
+// that replaced it, or OpenAI), which as a rule takes its refresh token with it,
+// so signing in again is what helps. An expired one Codex can usually renew.
+function rejectedTokenError(credentials, nowSeconds) {
+  return credentials.expiresAt !== null && credentials.expiresAt > nowSeconds
+    ? SIGNED_OUT
+    : SIGN_IN_EXPIRED;
+}
+
+async function fetchUsage(credentials, fetchFn, nowSeconds) {
   let response;
   try {
     response = await fetchFn(USAGE_ENDPOINT, {
@@ -103,7 +118,7 @@ async function fetchUsage(credentials, fetchFn) {
     return { error: error?.name === "TimeoutError" ? "timed out" : "unreachable" };
   }
   if (response.status === 401) {
-    return { error: "sign-in expired" };
+    return { error: rejectedTokenError(credentials, nowSeconds) };
   }
   if (!response.ok) {
     return { error: `HTTP ${response.status}` };
@@ -127,9 +142,9 @@ async function createProxyAwareTransport() {
 
 // Live 5h and weekly quota of every official OpenAI account. Tokens are only
 // ever read: refresh tokens are single-use, so refreshing one here could sign
-// out a running Codex. An account whose access token expired reports that
-// instead. One account failing never affects the others.
-export async function getAccountUsage(codexHome, { fetchFn } = {}) {
+// out a running Codex. An account whose token is rejected reports whether it
+// expired or was signed out instead. One account failing never affects the others.
+export async function getAccountUsage(codexHome, { fetchFn, now = Date.now() } = {}) {
   const registry = await readRegistry(codexHome);
   const accounts = registry.accounts.filter(isOfficialAccount);
   if (!accounts.length) {
@@ -156,9 +171,9 @@ export async function getAccountUsage(codexHome, { fetchFn } = {}) {
         : await readAuthData(path.join(accountsDir, accountKeyToFilename(account.account_key)));
       const credentials = credentialsFor(account, authData);
       if (!credentials) {
-        return { ...row, error: "no saved login" };
+        return { ...row, error: NO_SAVED_LOGIN };
       }
-      return { ...row, ...await fetchUsage(credentials, transport.fetchFn) };
+      return { ...row, ...await fetchUsage(credentials, transport.fetchFn, Math.floor(now / 1000)) };
     }));
   } finally {
     await transport.close?.();
@@ -216,6 +231,22 @@ function quotaColor(cell) {
   return percent <= LOW_QUOTA_PERCENT ? ANSI.yellow : ANSI.green;
 }
 
+// What to run for an account that can't be read because of its sign-in. `cx
+// add` signing in to a registered account replaces its saved login.
+function signInHint(row) {
+  const signInAgain = `cx add, then sign in as ${row.label}`;
+  if (row.error === SIGN_IN_EXPIRED) {
+    const renew = row.active
+      ? "use Codex to renew it"
+      : `cx switch ${shellArgument(row.label)} and use Codex to renew it`;
+    return `${row.label}: ${renew}. If Codex asks you to sign in, run ${signInAgain}.`;
+  }
+  if (row.error === SIGNED_OUT || row.error === NO_SAVED_LOGIN) {
+    return `${row.label}: run ${signInAgain}.`;
+  }
+  return null;
+}
+
 function usageTitle() {
   return colorize("ACCOUNT USAGE", ANSI.cyan, colorEnabled());
 }
@@ -236,11 +267,13 @@ export function renderUsage(rows, { now = Date.now() } = {}) {
     return showOther ? [...cells, formatOtherQuotas(row.other, nowSeconds)] : cells;
   });
   const headers = ["ACCOUNT", "PLAN", "5H LEFT", "WEEKLY LEFT", ...(showOther ? ["OTHER LIMITS"] : [])];
+  const hints = rows.map(signInHint).filter(Boolean);
   return [
     usageTitle(),
     buildTable(headers, tableRows, {
       cellColor: (index, cell) => (index === FIVE_HOUR_COLUMN || index === WEEKLY_COLUMN ? quotaColor(cell) : null)
-    })
+    }),
+    ...(hints.length ? ["", "To sign in again:", ...hints.map((hint) => `  ${hint}`)] : [])
   ].join("\n");
 }
 
@@ -248,7 +281,7 @@ export function renderUsage(rows, { now = Date.now() } = {}) {
 // status, which must keep working when the registry can't be read.
 export async function renderAccountUsage(codexHome, { fetchFn, now } = {}) {
   try {
-    return renderUsage(await getAccountUsage(codexHome, { fetchFn }), { now });
+    return renderUsage(await getAccountUsage(codexHome, { fetchFn, now }), { now });
   } catch (error) {
     return `${usageTitle()}\nUnavailable: ${error instanceof Error ? error.message : String(error)}`;
   }

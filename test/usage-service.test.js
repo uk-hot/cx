@@ -268,6 +268,46 @@ test("one failing account does not affect the others", async (t) => {
   assert.equal(rows.at(-1).weekly.remainingPercent, 40);
 });
 
+test("a rejected token is expired or signed out depending on its expiry", async (t) => {
+  const now = 1_000_000 * 1000;
+  const nowSeconds = now / 1000;
+  const tokens = {
+    lapsed: jwt({ sub: "user-lapsed", exp: nowSeconds - 60 }),
+    revoked: jwt({ sub: "user-revoked", exp: nowSeconds + 3600 }),
+    opaque: "access-opaque"
+  };
+  const names = Object.keys(tokens);
+  const accounts = names.map((name) => accountFor(name));
+  const snapshots = Object.fromEntries(names.map((name, index) => [
+    accounts[index].account_key,
+    authFor(name, tokens[name])
+  ]));
+  const codexHome = await makeHome(t, { accounts, snapshots });
+
+  const rows = await getAccountUsage(codexHome, { now, fetchFn: async () => respondWith({}, 401) });
+
+  assert.deepEqual(rows.map((row) => row.error), ["sign-in expired", "signed out", "sign-in expired"]);
+});
+
+test("accounts that need a new sign-in get the command that fixes them", () => {
+  const output = renderUsage([
+    { label: "live@example.com", active: true, error: "sign-in expired" },
+    { label: "idle@example.com", active: false, error: "sign-in expired" },
+    { label: "my work", active: false, error: "signed out" },
+    { label: "lost@example.com", active: false, error: "no saved login" },
+    { label: "slow@example.com", active: false, error: "timed out" }
+  ]);
+
+  assert.match(output, /^To sign in again:$/m);
+  assert.match(output, /^ {2}live@example\.com: use Codex to renew it\. If Codex asks you to sign in, run cx add, then sign in as live@example\.com\.$/m);
+  assert.match(output, /^ {2}idle@example\.com: cx switch idle@example\.com and use Codex to renew it\. If Codex asks/m);
+  assert.match(output, /^ {2}my work: run cx add, then sign in as my work\.$/m);
+  assert.match(output, /^ {2}lost@example\.com: run cx add, then sign in as lost@example\.com\.$/m);
+  assert.doesNotMatch(output, /slow@example\.com:/);
+  assert.match(renderUsage([{ label: "my work", active: false, error: "sign-in expired" }]), /cx switch 'my work' and/);
+  assert.doesNotMatch(renderUsage([{ label: "ok@example.com", active: false, plan: "team" }]), /sign in again/);
+});
+
 test("an account with no usable saved login is reported without a request", async (t) => {
   const missing = accountFor("missing");
   const wrong = accountFor("wrong");

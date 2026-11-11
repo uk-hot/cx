@@ -64,12 +64,20 @@ are still listed:
 - `sign-in expired`: its saved access token has expired. `cx status` never
   refreshes tokens, because a refresh token is single-use and refreshing one here
   could sign out a running Codex. `cx switch` to the account and use Codex to
-  renew it.
+  renew it. If Codex asks you to sign in instead, its login is gone: sign in to
+  it again with `cx add` (see [Signing in again](#signing-in-again)).
+- `signed out`: its access token was rejected before it expired, so the login
+  was revoked — by `codex logout`, by signing in to the account somewhere that
+  replaced this login, or by OpenAI. Codex usually can't renew it; sign in to
+  it again with `cx add`.
 - `no saved login`: its snapshot is missing, malformed or belongs to another
-  account.
+  account. Sign in to it again with `cx add`.
 - `timed out`, `unreachable`, `HTTP <code>`: the usage request failed.
 - `unexpected response`: the usage endpoint answered in a format `cx` doesn't
   know.
+
+For each account with one of the first three, the table is followed by the
+command that fixes it.
 
 The request honours `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`. It doesn't use
 the macOS or Windows system proxy, so set those variables if chatgpt.com is only
@@ -91,8 +99,12 @@ cx add work       # also gives the new account an alias
 
 Close Codex before running `cx add`. If you exit Codex without signing in, the
 previous login is restored. Signing in to a registered account refreshes its
-credentials instead of adding a duplicate, which also recovers an expired login.
-If the browser opens an account that is already signed in, use a private window.
+credentials instead of adding a duplicate, which also recovers an expired or
+revoked login (see [Signing in again](#signing-in-again)). If the browser opens
+an account that is already signed in, use a private window.
+
+When `cx add` signs in to an account that isn't the one Codex was using, it says
+so and prints the `cx switch` that goes back to the previous one.
 
 An API key or another login without an email needs the alias: pass it to
 `cx add`, or run `cx add <alias>` after Codex exits. If `cx add` is interrupted
@@ -118,6 +130,23 @@ Like `cx switch`, a `cx add` that signs in (including one that refreshes an
 already registered account) restarts a running Codex app-server daemon so it
 uses the new login (see below). Snapshotting a third-party provider or an API
 key doesn't change the login, so it leaves the daemon alone.
+
+#### Signing in again
+
+An account whose login expired or was revoked — `cx status` shows `sign-in
+expired` or `signed out`, or Codex says its access token could not be refreshed
+and asks you to sign in — doesn't need to be removed and added back. Run
+`cx add` and sign in to that same account: its saved login is replaced, and its
+alias and registration are kept.
+
+```bash
+cx add            # sign in as the account that expired
+```
+
+If the browser picks another account that is already signed in, that account is
+added (or refreshed) instead; sign in to the right one in a private window. A
+login whose access token merely expired can usually be renewed without signing
+in: `cx switch` to it and use Codex.
 
 ### `cx switch <email|alias>`
 
@@ -209,6 +238,16 @@ closing Codex to sync them.
 - Close Codex and the Codex app before switching if files are reported as locked.
 
 ## Changelog
+
+### 0.2.12
+
+- `cx status` tells an expired sign-in (`sign-in expired`) from a revoked one
+  (`signed out`), and prints under the usage table the command that fixes each
+  account that needs a new sign-in.
+- The help and README explain that `cx add` also signs in again to a registered
+  account whose login expired or was revoked, keeping its alias.
+- After `cx add` signs in to another account, it prints how to switch back to
+  the previous one.
 
 ### 0.2.11
 
