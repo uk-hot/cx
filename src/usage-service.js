@@ -1,16 +1,9 @@
 import fs from "node:fs/promises";
-import path from "node:path";
 
-import {
-  accountDisplayName,
-  accountKeyToFilename,
-  decodeJwtPayload,
-  parseAuthFile,
-  readRegistry,
-  resolveAccountsDir,
-  resolveAuthPath
-} from "./auth-service.js";
-import { DEFAULT_PROVIDER } from "./constants.js";
+import { decodeJwtPayload, parseAuthFile } from "./auth-file.js";
+import { readConfigText, readCurrentProviderFromConfigText } from "./config-file.js";
+import { DEFAULT_PROVIDER, codexPaths } from "./constants.js";
+import { accountDisplayName, readRegistry, snapshotPaths } from "./registry.js";
 import { ANSI, buildTable, colorEnabled, colorize, shellArgument } from "./terminal-ui.js";
 
 const USAGE_ENDPOINT = "https://chatgpt.com/backend-api/wham/usage";
@@ -25,14 +18,30 @@ const SIGN_IN_EXPIRED = "sign-in expired";
 const SIGNED_OUT = "signed out";
 const NO_SAVED_LOGIN = "no saved login";
 
+/** @typedef {import("./registry.js").Account} Account */
+/**
+ * The part of fetch the usage request needs, so the global fetch, undici's and
+ * a test double all fit.
+ * @typedef {(url: string, init: { headers: Record<string, string>, signal: AbortSignal }) => Promise<{ status: number, ok: boolean, json(): Promise<unknown> }>} FetchFn
+ */
+/** @typedef {{ accessToken: string, accountId: string, expiresAt: number | null }} Credentials */
+/** @typedef {{ remainingPercent: number, resetsAt: number | null, windowSeconds: number | null }} Quota */
+/** @typedef {{ plan: string | null, fiveHour: Quota | null, weekly: Quota | null, other: Quota[] }} Usage */
+/** @typedef {{ label: string, active: boolean, error?: string } & Partial<Usage>} UsageRow */
+
 // Usage limits exist only for ChatGPT sign-ins to OpenAI itself: API keys and
 // third-party providers have none.
+/** @param {Account} account */
 function isOfficialAccount(account) {
   return typeof account?.account_key === "string"
     && (account.provider ?? DEFAULT_PROVIDER) === DEFAULT_PROVIDER
     && String(account.auth_mode ?? "").toLowerCase() === "chatgpt";
 }
 
+/**
+ * @param {string} filePath
+ * @returns {Promise<any>}
+ */
 async function readAuthData(filePath) {
   try {
     return JSON.parse(await fs.readFile(filePath, "utf8"));
@@ -41,16 +50,25 @@ async function readAuthData(filePath) {
   }
 }
 
+/**
+ * @param {Account} account
+ * @param {any} authData
+ * @returns {Credentials | null}
+ */
 function credentialsFor(account, authData) {
   const parsed = parseAuthFile(authData);
   const accessToken = authData?.tokens?.access_token;
-  if (parsed?.accountKey !== account.account_key || typeof accessToken !== "string") {
+  if (!parsed || parsed.accountKey !== account.account_key || typeof accessToken !== "string") {
     return null;
   }
   const exp = decodeJwtPayload(accessToken)?.exp;
   return { accessToken, accountId: parsed.accountId, expiresAt: Number.isFinite(exp) ? exp : null };
 }
 
+/**
+ * @param {any} window
+ * @returns {Quota | null}
+ */
 function toQuota(window) {
   if (!Number.isFinite(window?.used_percent)) {
     return null;
@@ -64,6 +82,10 @@ function toQuota(window) {
 
 // A null rate_limit is a plan without limits. Anything else that doesn't have
 // the known fields means the undocumented endpoint changed.
+/**
+ * @param {any} rateLimit
+ * @returns {any[] | null}
+ */
 function usageWindows(rateLimit) {
   if (rateLimit === null) {
     return [];
@@ -77,12 +99,16 @@ function usageWindows(rateLimit) {
 // Windows are matched by length, not position: a plan with a single limit
 // reports it as the primary window. One that is neither 5h nor weekly is kept
 // apart instead of being shown under the wrong heading.
+/**
+ * @param {any} body
+ * @returns {Usage | null}
+ */
 function parseUsageBody(body) {
-  const windows = usageWindows(body?.rate_limit);
-  const quotas = windows?.map(toQuota);
-  if (!quotas || quotas.includes(null)) {
+  const maybeQuotas = usageWindows(body?.rate_limit)?.map(toQuota);
+  if (!maybeQuotas || maybeQuotas.includes(null)) {
     return null;
   }
+  const quotas = /** @type {Quota[]} */ (maybeQuotas);
   const fiveHour = quotas.find((quota) => quota.windowSeconds === FIVE_HOUR_WINDOW_SECONDS) ?? null;
   const weekly = quotas.find((quota) => quota.windowSeconds === WEEKLY_WINDOW_SECONDS) ?? null;
   return {
@@ -96,12 +122,22 @@ function parseUsageBody(body) {
 // A token rejected before it expires was revoked (by `codex logout`, a sign-in
 // that replaced it, or OpenAI), which as a rule takes its refresh token with it,
 // so signing in again is what helps. An expired one Codex can usually renew.
+/**
+ * @param {Credentials} credentials
+ * @param {number} nowSeconds
+ */
 function rejectedTokenError(credentials, nowSeconds) {
   return credentials.expiresAt !== null && credentials.expiresAt > nowSeconds
     ? SIGNED_OUT
     : SIGN_IN_EXPIRED;
 }
 
+/**
+ * @param {Credentials} credentials
+ * @param {FetchFn} fetchFn
+ * @param {number} nowSeconds
+ * @returns {Promise<Usage | { error: string }>}
+ */
 async function fetchUsage(credentials, fetchFn, nowSeconds) {
   let response;
   try {
@@ -115,7 +151,7 @@ async function fetchUsage(credentials, fetchFn, nowSeconds) {
       signal: AbortSignal.timeout(USAGE_TIMEOUT_MS)
     });
   } catch (error) {
-    return { error: error?.name === "TimeoutError" ? "timed out" : "unreachable" };
+    return { error: /** @type {Error} */ (error)?.name === "TimeoutError" ? "timed out" : "unreachable" };
   }
   if (response.status === 401) {
     return { error: rejectedTokenError(credentials, nowSeconds) };
@@ -131,6 +167,7 @@ async function fetchUsage(credentials, fetchFn, nowSeconds) {
 // chatgpt.com only through a proxy needs undici's own. Loaded on demand because
 // only this request uses it. It has to be closed: a timed-out request leaves a
 // connection to an unresponsive proxy open, which keeps the process alive.
+/** @returns {Promise<{ fetchFn: FetchFn, close?: () => Promise<void> }>} */
 async function createProxyAwareTransport() {
   const { EnvHttpProxyAgent, fetch: undiciFetch } = await import("undici");
   const dispatcher = new EnvHttpProxyAgent();
@@ -144,18 +181,29 @@ async function createProxyAwareTransport() {
 // ever read: refresh tokens are single-use, so refreshing one here could sign
 // out a running Codex. An account whose token is rejected reports whether it
 // expired or was signed out instead. One account failing never affects the others.
+/**
+ * @param {string} codexHome
+ * @param {{ fetchFn?: FetchFn, now?: number }} [options]
+ * @returns {Promise<UsageRow[]>}
+ */
 export async function getAccountUsage(codexHome, { fetchFn, now = Date.now() } = {}) {
   const registry = await readRegistry(codexHome);
   const accounts = registry.accounts.filter(isOfficialAccount);
   if (!accounts.length) {
     return [];
   }
+  /** @type {{ fetchFn: FetchFn, close?: () => Promise<void> }} */
   const transport = fetchFn ? { fetchFn } : await createProxyAwareTransport();
   // The logged-in account's newest tokens are in auth.json, where Codex
-  // refreshes them; its snapshot may be older.
-  const liveAuth = await readAuthData(resolveAuthPath(codexHome));
-  const liveAccountKey = parseAuthFile(liveAuth)?.accountKey ?? null;
-  const accountsDir = resolveAccountsDir(codexHome);
+  // refreshes them; its snapshot may be older. With a third-party provider in
+  // use, auth.json holds only the tokens of an earlier ChatGPT login, which may
+  // be older than that account's snapshot.
+  const paths = codexPaths(codexHome);
+  const liveAuth = await readAuthData(paths.auth);
+  const configText = await readConfigText(paths.config).catch(() => "");
+  const liveAccountKey = readCurrentProviderFromConfigText(configText).provider === DEFAULT_PROVIDER
+    ? parseAuthFile(liveAuth)?.accountKey ?? null
+    : null;
 
   try {
     return await Promise.all(accounts.map(async (account) => {
@@ -168,7 +216,7 @@ export async function getAccountUsage(codexHome, { fetchFn, now = Date.now() } =
       };
       const authData = account.account_key === liveAccountKey
         ? liveAuth
-        : await readAuthData(path.join(accountsDir, accountKeyToFilename(account.account_key)));
+        : await readAuthData(snapshotPaths(codexHome, account.account_key).auth);
       const credentials = credentialsFor(account, authData);
       if (!credentials) {
         return { ...row, error: NO_SAVED_LOGIN };
@@ -180,6 +228,7 @@ export async function getAccountUsage(codexHome, { fetchFn, now = Date.now() } =
   }
 }
 
+/** @param {number} seconds */
 function formatDuration(seconds) {
   const minutes = Math.ceil(Math.max(0, seconds) / 60);
   if (minutes < 60) {
@@ -191,6 +240,10 @@ function formatDuration(seconds) {
   return `${Math.floor(minutes / 1440)}d ${Math.floor(minutes / 60) % 24}h`;
 }
 
+/**
+ * @param {Quota | null | undefined} quota
+ * @param {number} nowSeconds
+ */
 function formatQuota(quota, nowSeconds) {
   if (!quota) {
     return "-";
@@ -201,6 +254,7 @@ function formatQuota(quota, nowSeconds) {
     : `${percent} (resets in ${formatDuration(quota.resetsAt - nowSeconds)})`;
 }
 
+/** @param {number | null} seconds */
 function formatWindowLength(seconds) {
   if (seconds === null) {
     return "unknown window";
@@ -211,6 +265,10 @@ function formatWindowLength(seconds) {
   return seconds % 3600 === 0 ? `${seconds / 3600}h` : `${Math.ceil(seconds / 60)}m`;
 }
 
+/**
+ * @param {Quota[] | undefined} quotas
+ * @param {number} nowSeconds
+ */
 function formatOtherQuotas(quotas, nowSeconds) {
   if (!quotas?.length) {
     return "-";
@@ -220,6 +278,7 @@ function formatOtherQuotas(quotas, nowSeconds) {
     .join(", ");
 }
 
+/** @param {string} cell */
 function quotaColor(cell) {
   const percent = Number.parseInt(cell, 10);
   if (!Number.isFinite(percent)) {
@@ -233,6 +292,7 @@ function quotaColor(cell) {
 
 // What to run for an account that can't be read because of its sign-in. `cx
 // add` signing in to a registered account replaces its saved login.
+/** @param {UsageRow} row */
 function signInHint(row) {
   const signInAgain = `cx add, then sign in as ${row.label}`;
   if (row.error === SIGN_IN_EXPIRED) {
@@ -251,6 +311,10 @@ function usageTitle() {
   return colorize("ACCOUNT USAGE", ANSI.cyan, colorEnabled());
 }
 
+/**
+ * @param {UsageRow[]} rows
+ * @param {{ now?: number }} [options]
+ */
 export function renderUsage(rows, { now = Date.now() } = {}) {
   if (!rows.length) {
     return `${usageTitle()}\nNo accounts signed in with ChatGPT.`;
@@ -279,6 +343,10 @@ export function renderUsage(rows, { now = Date.now() } = {}) {
 
 // The usage section never fails `cx status`: it is an addition to the local
 // status, which must keep working when the registry can't be read.
+/**
+ * @param {string} codexHome
+ * @param {{ fetchFn?: FetchFn, now?: number }} [options]
+ */
 export async function renderAccountUsage(codexHome, { fetchFn, now } = {}) {
   try {
     return renderUsage(await getAccountUsage(codexHome, { fetchFn, now }), { now });

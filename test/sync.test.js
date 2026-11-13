@@ -6,9 +6,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import Database from "better-sqlite3";
-
 import { runSync } from "../src/service.js";
+import { loadDatabaseSync } from "../src/sqlite-state.js";
+
+const Database = loadDatabaseSync();
 
 function sessionMeta(id, provider) {
   return JSON.stringify({ type: "session_meta", payload: { id, model_provider: provider } });
@@ -37,7 +38,7 @@ async function makeCodexHome(t, threads) {
 }
 
 function readProviders(codexHome) {
-  const db = new Database(path.join(codexHome, "state_5.sqlite"), { readonly: true });
+  const db = new Database(path.join(codexHome, "state_5.sqlite"), { readOnly: true });
   try {
     return Object.fromEntries(db.prepare("SELECT id, model_provider FROM threads").all().map((row) => [row.id, row.model_provider]));
   } finally {
@@ -63,12 +64,15 @@ test("sync rewrites rollouts, keeps their mode and updates SQLite", async (t) =>
   assert.equal(result.sqliteRowsUpdated, 2);
   assert.deepEqual(readProviders(codexHome), { a: "any", b: "any" });
   for (const filePath of Object.values(files)) {
-    assert.equal((await fsp.stat(filePath)).mode & 0o777, 0o600);
+    // Windows has no POSIX permission bits to keep.
+    if (process.platform !== "win32") {
+      assert.equal((await fsp.stat(filePath)).mode & 0o777, 0o600);
+    }
     assert.equal((await fsp.readFile(filePath, "utf8")).split("\n")[1], "{\"n\":1}");
   }
 });
 
-test("sync skips rollouts another process has open and leaves their rows alone", { skip: process.platform !== "linux" }, async (t) => {
+test("sync skips rollouts another process has open and leaves their rows alone", { skip: !["linux", "win32"].includes(process.platform) }, async (t) => {
   const { codexHome, files } = await makeCodexHome(t, ["busy", "idle"]);
   await holdOpen(t, files.busy);
   const inodeBefore = (await fsp.stat(files.busy)).ino;
@@ -116,7 +120,7 @@ test("sync shares account-scoped threads with every account, including on the sa
   }
   assert.equal(await fsp.readFile(files.plain, "utf8"), plainBefore);
 
-  const check = new Database(path.join(codexHome, "state_5.sqlite"), { readonly: true });
+  const check = new Database(path.join(codexHome, "state_5.sqlite"), { readOnly: true });
   try {
     assert.deepEqual(
       check.prepare("SELECT COUNT(*) AS n FROM threads WHERE creator_user_id IS NOT NULL OR creator_account_id IS NOT NULL").get().n,
@@ -131,7 +135,7 @@ test("sync shares account-scoped threads with every account, including on the sa
   assert.equal(again.sqliteRowsUpdated, 0);
 });
 
-test("sync leaves the creator of a skipped rollout in place", { skip: process.platform !== "linux" }, async (t) => {
+test("sync leaves the creator of a skipped rollout in place", { skip: !["linux", "win32"].includes(process.platform) }, async (t) => {
   const { codexHome, files } = await makeCodexHome(t, ["busy"]);
   const header = JSON.stringify({ type: "session_meta", payload: { account_scoped: true, creator_account_id: "acct-a", id: "busy", model_provider: "openai" } });
   await fsp.writeFile(files.busy, `${header}\n{"n":1}\n`, { mode: 0o600 });
@@ -144,11 +148,29 @@ test("sync leaves the creator of a skipped rollout in place", { skip: process.pl
   const result = await runSync({ codexHome });
   assert.deepEqual(result.skippedLockedRolloutFiles, [files.busy]);
   assert.equal(result.sqliteRowsUpdated, 0);
-  const check = new Database(path.join(codexHome, "state_5.sqlite"), { readonly: true });
+  const check = new Database(path.join(codexHome, "state_5.sqlite"), { readOnly: true });
   try {
     assert.equal(check.prepare("SELECT creator_account_id FROM threads WHERE id = 'busy'").get().creator_account_id, "acct-a");
   } finally {
     check.close();
   }
   assert.match(await fsp.readFile(files.busy, "utf8"), /"account_scoped":true/);
+});
+
+test("sync skips a rollout whose thread writer lock Codex holds open", { skip: !["linux", "win32"].includes(process.platform) }, async (t) => {
+  const thread = "01a1d42f-359d-7b20-b275-64ee4b89d2e9";
+  const idle = "01a1d4c4-bb04-7822-85e4-e0f9f716220c";
+  const { codexHome, files } = await makeCodexHome(t, [thread, idle]);
+  const lockDir = path.join(codexHome, "thread-writer-locks");
+  await fsp.mkdir(lockDir);
+  // A lock left behind by a Codex that exited is not held open.
+  await fsp.writeFile(path.join(lockDir, `${idle}.lock`), "");
+  const lockPath = path.join(lockDir, `${thread}.lock`);
+  await fsp.writeFile(lockPath, "");
+  await holdOpen(t, lockPath);
+
+  const result = await runSync({ codexHome });
+  assert.deepEqual(result.skippedLockedRolloutFiles, [files[thread]]);
+  assert.equal(result.changedSessionFiles, 1);
+  assert.deepEqual(readProviders(codexHome), { [thread]: "openai", [idle]: "any" });
 });

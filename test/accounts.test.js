@@ -5,14 +5,13 @@ import path from "node:path";
 import test from "node:test";
 
 import {
-  accountKeyToConfigFilename,
-  accountKeyToFilename,
   addAccount,
   addNeedsLogin,
   removeAccount,
   syncActiveAccountFromCurrentAuth,
   useAccount
-} from "../src/auth-service.js";
+} from "../src/accounts.js";
+import { accountKeyToConfigFilename, accountKeyToFilename } from "../src/registry.js";
 
 function jwt(payload) {
   const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
@@ -185,6 +184,10 @@ test("add with a third-party provider ignores ChatGPT tokens left in auth.json",
   const result = await addAccount(codexHome, "work");
   assert.equal(result.accountKey, "manual::work");
 
+  // Windows has no POSIX permission bits to check.
+  if (process.platform === "win32") {
+    return;
+  }
   const accountsDir = path.join(codexHome, "accounts");
   for (const name of [accountKeyToFilename("manual::work"), accountKeyToConfigFilename("manual::work"), "registry.json"]) {
     const { mode } = await fs.stat(path.join(accountsDir, name));
@@ -347,4 +350,70 @@ test("removing an API key that is not in use records nothing", async (t) => {
 
   await removeAccount(codexHome, "key");
   assert.equal((await readRegistry()).removed_auth_sha256, undefined);
+});
+
+// Official account "a@x" plus third-party account "tp", registered the way
+// `cx add` does it: the third-party snapshot keeps the ChatGPT tokens that were
+// in auth.json at the time.
+async function setupOfficialAndThirdParty(t, prefix) {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  t.after(() => fs.rm(codexHome, { recursive: true, force: true }));
+  const authPath = path.join(codexHome, "auth.json");
+  const configPath = path.join(codexHome, "config.toml");
+  const officialAuth = (refreshToken, lastRefresh) => ({
+    ...oauthAuth({ userId: "user-1", accountId: "account-1", refreshToken }),
+    ...(lastRefresh ? { last_refresh: lastRefresh } : {})
+  });
+  await writeJson(authPath, officialAuth("rt-1", "2026-11-01T00:00:00Z"));
+  await fs.writeFile(configPath, "model_provider = \"openai\"\n", "utf8");
+  await addAccount(codexHome);
+  await fs.writeFile(configPath, "model_provider = \"third-party\"\n", "utf8");
+  await addAccount(codexHome, "tp");
+  const readJson = async (filePath) => JSON.parse(await fs.readFile(filePath, "utf8"));
+  const officialSnapshot = path.join(codexHome, "accounts", accountKeyToFilename("user-1::account-1"));
+  return { codexHome, authPath, officialAuth, readJson, officialSnapshot };
+}
+
+test("switching back from a third-party account keeps the official account's newer tokens", async (t) => {
+  const { codexHome, authPath, officialAuth, readJson, officialSnapshot } = await setupOfficialAndThirdParty(t, "cx-auth-stale-");
+
+  await useAccount(codexHome, "user@example.com");
+  // Codex rotates the refresh token; rt-1 is now used up.
+  await writeJson(authPath, officialAuth("rt-2", "2026-11-10T00:00:00Z"));
+  await useAccount(codexHome, "tp");
+  assert.equal((await readJson(authPath)).tokens.refresh_token, "rt-1", "the third-party snapshot holds the old tokens");
+
+  await useAccount(codexHome, "user@example.com");
+  assert.equal((await readJson(officialSnapshot)).tokens.refresh_token, "rt-2");
+  assert.equal((await readJson(authPath)).tokens.refresh_token, "rt-2");
+});
+
+test("ChatGPT tokens left in auth.json do not make their account active while a third-party provider is in use", async (t) => {
+  const { codexHome } = await setupOfficialAndThirdParty(t, "cx-auth-active-");
+  const registryPath = path.join(codexHome, "accounts", "registry.json");
+  const activeKey = async () => JSON.parse(await fs.readFile(registryPath, "utf8")).active_account_key;
+  assert.equal(await activeKey(), "manual::tp");
+
+  assert.equal(await syncActiveAccountFromCurrentAuth(codexHome), false);
+  assert.equal(await activeKey(), "manual::tp");
+
+  // Removing the official account leaves the third-party one active.
+  await removeAccount(codexHome, "user@example.com");
+  assert.equal(await activeKey(), "manual::tp");
+});
+
+test("a snapshot is not replaced by live tokens that were refreshed before it", async (t) => {
+  const { codexHome, authPath, officialAuth, readJson, officialSnapshot } = await setupOfficialAndThirdParty(t, "cx-auth-older-");
+  await useAccount(codexHome, "user@example.com");
+  await writeJson(officialSnapshot, officialAuth("rt-new", "2026-11-12T00:00:00Z"));
+  await writeJson(authPath, officialAuth("rt-old", "2026-11-05T00:00:00Z"));
+
+  await useAccount(codexHome, "tp");
+  assert.equal((await readJson(officialSnapshot)).tokens.refresh_token, "rt-new");
+
+  // Newer live tokens are saved as before.
+  await useAccount(codexHome, "user@example.com");
+  await writeJson(authPath, officialAuth("rt-newest", "2026-11-13T00:00:00Z"));
+  await useAccount(codexHome, "tp");
+  assert.equal((await readJson(officialSnapshot)).tokens.refresh_token, "rt-newest");
 });

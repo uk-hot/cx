@@ -12,15 +12,7 @@ Codex home is fixed to `~/.codex`.
 
 ## Requirements
 
-- **Node.js >= 22**
-- Native dependency **`better-sqlite3`** (compiled/prebuilt at install time)
-
-> **Note (npm 11.16+ / npm 12):** install scripts are gated by `allowScripts`.
-> If the native build is skipped during a global install, allow it explicitly:
->
-> ```bash
-> npm install -g --allow-scripts=better-sqlite3 @uk-hot/cx
-> ```
+- **Node.js 22.13+ or 23.4+** (uses the built-in `node:sqlite`; no native addon, no install scripts)
 
 ## Install
 
@@ -237,9 +229,11 @@ On a `switch` (and its underlying sync), `cx`:
    back, so the two stores do not diverge.
 
 Open files are detected via `/proc` on Linux, `lsof` on macOS, and an exclusive
-open on Windows, where rollouts are rewritten via a single batched PowerShell
-pass. Skipped files are reported rather than corrupted; re-run `cx switch` after
-closing Codex to sync them.
+open on Windows, which cx keeps while it rewrites the file so Codex cannot open
+it in between. A thread whose writer lock (`~/.codex/thread-writer-locks/`,
+Codex 0.168+) is held open counts as in use too, even while its rollout file is
+closed. Skipped files are reported rather than corrupted; re-run
+`cx switch` after closing Codex to sync them.
 
 ## Data & safety
 
@@ -254,6 +248,29 @@ closing Codex to sync them.
 - Close Codex and the Codex app before switching if files are reported as locked.
 
 ## Changelog
+
+### 0.3.0
+
+- Use Node's built-in `node:sqlite` instead of `better-sqlite3`: no native
+  addon, no install scripts, and no `prebuild-install` deprecation warning.
+  Requires Node.js 22.13+ or 23.4+ (23.0–23.3 still hide `node:sqlite` behind
+  a flag).
+- Windows: rewrite rollout files in Node with an exclusive open instead of
+  PowerShell scripts, so a switch no longer starts PowerShell (or needs
+  `-ExecutionPolicy Bypass`).
+- On Linux and macOS, a rollout file cx may not read or write is reported as an
+  error instead of being skipped as "in use".
+- Switching back from a third-party account no longer saves the stale ChatGPT
+  tokens left in `auth.json` over the official account's newer snapshot, which
+  signed that account out (its refresh token had already been used). A
+  snapshot is also never replaced by tokens with an older `last_refresh`.
+- With a third-party provider in use, `cx status`, `cx list` and `cx remove` no
+  longer mark the ChatGPT account whose old tokens are in `auth.json` as active,
+  and `cx status` queries that account's quota with its own snapshot.
+- A rollout whose thread writer lock Codex holds open is skipped as in use.
+- Errors that wrap another one print it on a `Caused by:` line.
+- Removed the undocumented `--account` and `--alias` options; pass the account
+  or alias as an argument.
 
 ### 0.2.13
 
@@ -354,6 +371,14 @@ included here.
   fails — keeping the database lock brief and the two stores consistent.
 - On Windows, rollout rewrites and rollbacks run in a single batched pass
   instead of one PowerShell process per file.
+
+## Development
+
+```bash
+npm ci
+npm test            # node --test
+npm run typecheck   # tsc over the JSDoc types in src/, no build step
+```
 
 ## License
 

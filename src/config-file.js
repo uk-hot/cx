@@ -1,6 +1,5 @@
-import fs from "node:fs/promises";
-
 import { DEFAULT_PROVIDER } from "./constants.js";
+import { readTextIfExists } from "./fs-utils.js";
 
 // Root keys that describe which provider/model an account talks to. On a
 // switch these come from the target account's snapshot; every other setting
@@ -24,18 +23,26 @@ const ACCOUNT_ROOT_KEYS = new Set([
 ]);
 const ACCOUNT_TABLE_KEYS = new Set(["model_providers", "profiles"]);
 
+/**
+ * @typedef {{ line: string, kind: "trivia" | "cont" } | { line: string, kind: "header" | "stmt", path: string[] }} TomlLine
+ * @typedef {{ path: string[] | null, lines: string[] }} RootItem a root statement with its continuation lines, or trivia
+ * @typedef {{ path: string[], lines: string[] }} TomlTable a table header and every line up to the next one
+ */
+
+/** @param {string} text */
 function splitLines(text) {
   return text.split(/\r?\n/);
 }
 
+/** @param {string} text */
 function detectNewline(text) {
   return text.includes("\r\n") ? "\r\n" : "\n";
 }
 
-function escapeTomlString(value) {
-  return value.replaceAll("\\", "\\\\").replaceAll("\"", "\\\"");
-}
-
+/**
+ * @param {string} text
+ * @param {number} index
+ */
 function skipBlanks(text, index) {
   while (text[index] === " " || text[index] === "\t") {
     index += 1;
@@ -44,6 +51,10 @@ function skipBlanks(text, index) {
 }
 
 // Reads a dotted key such as `a."b.c".d` starting at `start`.
+/**
+ * @param {string} text
+ * @param {number} start
+ */
 function readKeyPath(text, start) {
   const components = [];
   let index = start;
@@ -81,12 +92,18 @@ function readKeyPath(text, start) {
 // a continuation of a multi-line value, or trivia (blank/comment). Tracks
 // strings and bracket depth so `[` inside multi-line strings or arrays is not
 // mistaken for a table header.
+/**
+ * @param {string[]} lines
+ * @returns {TomlLine[]}
+ */
 function classifyTomlLines(lines) {
+  /** @type {string | null} */
   let state = null;
   let depth = 0;
 
   return lines.map((line) => {
     const trimmed = line.trim();
+    /** @type {TomlLine} */
     let entry;
     if (state !== null || depth > 0) {
       entry = { line, kind: "cont" };
@@ -144,9 +161,13 @@ function classifyTomlLines(lines) {
 
 // Splits a TOML document into root items ({ path, lines }) and tables
 // ({ path, lines }), keeping every original line so it can be re-joined.
+/** @param {string} text */
 function parseTomlSegments(text) {
+  /** @type {RootItem[]} */
   const root = [];
+  /** @type {TomlTable[]} */
   const tables = [];
+  /** @type {TomlTable | null} */
   let currentTable = null;
 
   for (const entry of classifyTomlLines(splitLines(text))) {
@@ -156,7 +177,7 @@ function parseTomlSegments(text) {
     } else if (currentTable) {
       currentTable.lines.push(entry.line);
     } else if (entry.kind === "cont" && root.length) {
-      root.at(-1).lines.push(entry.line);
+      root[root.length - 1].lines.push(entry.line);
     } else {
       root.push({ path: entry.kind === "stmt" ? entry.path : null, lines: [entry.line] });
     }
@@ -165,6 +186,11 @@ function parseTomlSegments(text) {
   return { root, tables };
 }
 
+/**
+ * The value of `key = "string"`, or null for any other value.
+ * @param {string} statementText
+ * @returns {string | null}
+ */
 function parseTomlStringValue(statementText) {
   const eqIndex = statementText.indexOf("=");
   if (eqIndex === -1) {
@@ -194,30 +220,36 @@ function parseTomlStringValue(statementText) {
   return null;
 }
 
+/**
+ * @param {RootItem[]} items
+ * @param {string} key
+ */
 function findStatementString(items, key) {
   const item = items.find((entry) => entry.path?.length === 1 && entry.path[0] === key);
   return item ? parseTomlStringValue(item.lines.join("\n")) : null;
 }
 
+/**
+ * @param {TomlTable} table
+ * @returns {RootItem[]}
+ */
 function tableStatements(table) {
   return classifyTomlLines(table.lines.slice(1))
-    .filter((entry) => entry.kind === "stmt")
-    .map((entry) => ({ path: entry.path, lines: [entry.line] }));
+    .flatMap((entry) => (entry.kind === "stmt" ? [{ path: entry.path, lines: [entry.line] }] : []));
 }
 
 // A missing config.toml is valid: Codex then runs with its defaults, which the
 // empty text describes (the default provider).
+/** @param {string} configPath */
 export async function readConfigText(configPath) {
-  try {
-    return await fs.readFile(configPath, "utf8");
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return "";
-    }
-    throw error;
-  }
+  return (await readTextIfExists(configPath)) ?? "";
 }
 
+/**
+ * The provider Codex uses: the active profile's, else the root one, else the default.
+ * @param {string} configText
+ * @returns {{ provider: string, implicit: boolean }}
+ */
 export function readCurrentProviderFromConfigText(configText) {
   const { root, tables } = parseTomlSegments(configText);
 
@@ -240,14 +272,25 @@ export function readCurrentProviderFromConfigText(configText) {
   return { provider: DEFAULT_PROVIDER, implicit: true };
 }
 
+/** @param {RootItem} item */
 function isAccountRootItem(item) {
   return item.path !== null && (ACCOUNT_ROOT_KEYS.has(item.path[0]) || ACCOUNT_TABLE_KEYS.has(item.path[0]));
 }
 
+/** @param {TomlTable} table */
 function isAccountTable(table) {
   return ACCOUNT_TABLE_KEYS.has(table.path[0]);
 }
 
+/**
+ * The live items with the account items swapped for the snapshot's, placed
+ * where the first live account item was (or at `fallbackIndex`).
+ * @template {RootItem} T
+ * @param {T[]} liveItems
+ * @param {T[]} snapshotItems
+ * @param {(item: T) => boolean} isAccountItem
+ * @param {(kept: T[]) => number} fallbackIndex
+ */
 function replaceItems(liveItems, snapshotItems, isAccountItem, fallbackIndex) {
   const kept = [];
   let insertIndex = -1;
@@ -266,6 +309,10 @@ function replaceItems(liveItems, snapshotItems, isAccountItem, fallbackIndex) {
 
 // Builds the config.toml for a switch: provider/model settings from the target
 // account's snapshot, everything else from the live config.
+/**
+ * @param {string} liveText
+ * @param {string} snapshotText
+ */
 export function mergeAccountConfigText(liveText, snapshotText) {
   const newline = detectNewline(liveText);
   const live = parseTomlSegments(liveText);
@@ -280,51 +327,8 @@ export function mergeAccountConfigText(liveText, snapshotText) {
   const tables = replaceItems(live.tables, snapshot.tables, isAccountTable, (kept) => kept.length);
 
   const lines = [...root, ...tables].flatMap((item) => item.lines);
-  while (lines.length && lines.at(-1).trim() === "") {
+  while (lines.length && lines[lines.length - 1].trim() === "") {
     lines.pop();
   }
   return `${lines.join(newline)}${newline}`;
-}
-
-export function listConfiguredProviderIds(configText) {
-  const providerIds = new Set([DEFAULT_PROVIDER]);
-  const regex = /^\[model_providers\.([A-Za-z0-9_.-]+)]\s*$/gm;
-  for (const match of configText.matchAll(regex)) {
-    providerIds.add(match[1]);
-  }
-  return [...providerIds].sort();
-}
-
-export function configDeclaresProvider(configText, provider) {
-  return listConfiguredProviderIds(configText).includes(provider);
-}
-
-export function setRootProviderInConfigText(configText, provider) {
-  const newline = detectNewline(configText);
-  const lines = splitLines(configText);
-  let insertIndex = lines.length;
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const trimmed = lines[index].trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      insertIndex = index + 1;
-      continue;
-    }
-    if (trimmed.startsWith("[")) {
-      insertIndex = index;
-      break;
-    }
-    if (/^model_provider\s*=/.test(trimmed)) {
-      lines[index] = `model_provider = "${escapeTomlString(provider)}"`;
-      return lines.join(newline);
-    }
-    insertIndex = index + 1;
-  }
-
-  lines.splice(insertIndex, 0, `model_provider = "${escapeTomlString(provider)}"`);
-  return lines.join(newline);
-}
-
-export async function writeConfigText(configPath, configText) {
-  await fs.writeFile(configPath, configText, "utf8");
 }

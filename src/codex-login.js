@@ -7,6 +7,10 @@ function ignoreInterrupt() {
   // Ctrl-C belongs to Codex; cx stays alive to finish or undo the add afterwards.
 }
 
+/**
+ * Runs Codex interactively so the user can sign in, and waits for it to exit.
+ * @param {string} codexHome
+ */
 export async function runCodexForLogin(codexHome) {
   let stopCodex = () => {};
   const onHangup = () => stopCodex();
@@ -32,7 +36,7 @@ export async function runCodexForLogin(codexHome) {
       child.once("close", resolve);
     });
   } catch (error) {
-    if (error?.code === "ENOENT") {
+    if (/** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT") {
       throw new Error("The codex command was not found. Install Codex, then run cx add again.");
     }
     throw error;

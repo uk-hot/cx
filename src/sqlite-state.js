@@ -1,52 +1,97 @@
 import fs from "node:fs/promises";
-import path from "node:path";
-import Database from "better-sqlite3";
+import { createRequire } from "node:module";
+import process from "node:process";
 
-import { CREATOR_COLUMNS, DB_FILE_BASENAME } from "./constants.js";
+import { CREATOR_COLUMNS, codexPaths } from "./constants.js";
 
-const DEFAULT_BUSY_TIMEOUT_MS = 5000;
+// How long a statement waits for a running Codex to release the database.
+const BUSY_TIMEOUT_MS = 5000;
+const require = createRequire(import.meta.url);
 
-export function stateDbPath(codexHome) {
-  return path.join(codexHome, DB_FILE_BASENAME);
+/** @type {typeof import("node:sqlite").DatabaseSync | undefined} */
+let DatabaseSync;
+
+// node:sqlite is built into Node 22.13+ and 23.4+ (23.0-23.3 still hide it
+// behind --experimental-sqlite) and needs no native addon, but it
+// still prints an ExperimentalWarning when first loaded. Load it lazily and
+// drop only that warning so cx output stays clean.
+export function loadDatabaseSync() {
+  if (DatabaseSync) {
+    return DatabaseSync;
+  }
+  /** @type {typeof import("node:sqlite").DatabaseSync} */
+  let loaded;
+  const originalEmitWarning = process.emitWarning;
+  /** @type {(warning: string | Error, ...args: any[]) => void} */
+  const filtered = function emitWarning(warning, ...args) {
+    const type = typeof args[0] === "string" ? args[0] : args[0]?.type;
+    const message = typeof warning === "string" ? warning : warning?.message;
+    if (type === "ExperimentalWarning" && /sqlite/i.test(message ?? "")) {
+      return;
+    }
+    return originalEmitWarning.call(process, warning, ...args);
+  };
+  process.emitWarning = filtered;
+  try {
+    ({ DatabaseSync: loaded } = require("node:sqlite"));
+  } catch (error) {
+    throw new Error(`cx needs Node.js 22.13+ or 23.4+ for the built-in node:sqlite module (running ${process.version}).`, { cause: error });
+  } finally {
+    process.emitWarning = originalEmitWarning;
+  }
+  DatabaseSync = loaded;
+  return loaded;
 }
 
+/** @param {string} dbPath */
 function openDatabase(dbPath) {
+  const Database = loadDatabaseSync();
   return new Database(dbPath);
 }
 
-function normalizeBusyTimeoutMs(busyTimeoutMs) {
-  return Number.isInteger(busyTimeoutMs) && busyTimeoutMs >= 0
-    ? busyTimeoutMs
-    : DEFAULT_BUSY_TIMEOUT_MS;
-}
-
-function setBusyTimeout(db, busyTimeoutMs) {
-  db.exec(`PRAGMA busy_timeout = ${normalizeBusyTimeoutMs(busyTimeoutMs)}`);
-}
-
+// SQLITE_BUSY (5) and SQLITE_LOCKED (6), with or without extended codes.
+/** @param {unknown} error */
 function isSqliteBusyError(error) {
-  const message = `${error?.code ?? ""} ${error?.message ?? ""}`.toLowerCase();
-  return message.includes("database is locked") || message.includes("sqlite_busy") || message.includes("busy");
+  const errcode = /** @type {{ errcode?: number }} */ (error)?.errcode;
+  return typeof errcode === "number" && ((errcode & 0xff) === 5 || (errcode & 0xff) === 6);
 }
 
+/**
+ * @param {unknown} error
+ * @param {string} action
+ */
 function wrapSqliteBusyError(error, action) {
   if (!isSqliteBusyError(error)) {
     return error;
   }
   return new Error(
-    `Unable to ${action} because state_5.sqlite is currently in use. Close Codex and the Codex app, then retry. Original error: ${error.message}`
+    `Unable to ${action} because state_5.sqlite is currently in use. Close Codex and the Codex app, then retry.`,
+    { cause: error }
   );
 }
 
-export async function readSqliteProviderCounts(codexHome) {
-  const dbPath = stateDbPath(codexHome);
+/**
+ * The state database, or null when Codex has not created one.
+ * @param {string} codexHome
+ */
+async function openStateDatabase(codexHome) {
+  const dbPath = codexPaths(codexHome).stateDb;
   try {
     await fs.access(dbPath);
   } catch {
     return null;
   }
-
   const db = openDatabase(dbPath);
+  db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+  return db;
+}
+
+/** @param {string} codexHome */
+export async function readSqliteProviderCounts(codexHome) {
+  const db = await openStateDatabase(codexHome);
+  if (!db) {
+    return null;
+  }
   try {
     const rows = db.prepare(`
       SELECT
@@ -60,13 +105,14 @@ export async function readSqliteProviderCounts(codexHome) {
       GROUP BY model_provider, archived
       ORDER BY archived, model_provider
     `).all();
+    /** @type {{ sessions: Record<string, number>, archived_sessions: Record<string, number> }} */
     const result = {
       sessions: {},
       archived_sessions: {}
     };
     for (const row of rows) {
       const bucket = row.archived ? result.archived_sessions : result.sessions;
-      bucket[row.model_provider] = row.count;
+      bucket[String(row.model_provider)] = Number(row.count);
     }
     return result;
   } finally {
@@ -74,17 +120,17 @@ export async function readSqliteProviderCounts(codexHome) {
   }
 }
 
-export async function assertSqliteWritable(codexHome, options = {}) {
-  const dbPath = stateDbPath(codexHome);
-  try {
-    await fs.access(dbPath);
-  } catch {
+/**
+ * Takes and drops the write lock, so a sync fails before touching any file
+ * when Codex holds the database.
+ * @param {string} codexHome
+ */
+export async function assertSqliteWritable(codexHome) {
+  const db = await openStateDatabase(codexHome);
+  if (!db) {
     return { databasePresent: false };
   }
-
-  const db = openDatabase(dbPath);
   try {
-    setBusyTimeout(db, options.busyTimeoutMs);
     db.exec("BEGIN IMMEDIATE");
     db.exec("ROLLBACK");
     return { databasePresent: true };
@@ -95,18 +141,18 @@ export async function assertSqliteWritable(codexHome, options = {}) {
   }
 }
 
-export async function updateSqliteProvider(codexHome, targetProvider, options = {}) {
-  const dbPath = stateDbPath(codexHome);
-  try {
-    await fs.access(dbPath);
-  } catch {
+/**
+ * @param {string} codexHome
+ * @param {string} targetProvider
+ * @param {{ skippedThreadIds: string[], skippedRolloutPaths: string[] }} skipped threads whose rollout was left alone
+ */
+export async function updateSqliteProvider(codexHome, targetProvider, { skippedThreadIds, skippedRolloutPaths }) {
+  const db = await openStateDatabase(codexHome);
+  if (!db) {
     return { updatedRows: 0, databasePresent: false };
   }
-
-  const db = openDatabase(dbPath);
   let transactionOpen = false;
   try {
-    setBusyTimeout(db, options.busyTimeoutMs);
     // Clear the creator columns (Codex 0.168+) along with the rollout headers.
     // Codex merges them back with COALESCE(row, rollout), so both must go.
     // Read the schema before taking the write lock to keep the lock short.
@@ -128,12 +174,12 @@ export async function updateSqliteProvider(codexHome, targetProvider, options = 
     const result = stmt.run(
       targetProvider,
       targetProvider,
-      JSON.stringify(options.skippedThreadIds ?? []),
-      JSON.stringify(options.skippedRolloutPaths ?? [])
+      JSON.stringify(skippedThreadIds),
+      JSON.stringify(skippedRolloutPaths)
     );
     db.exec("COMMIT");
     transactionOpen = false;
-    return { updatedRows: result.changes ?? 0, databasePresent: true };
+    return { updatedRows: Number(result.changes), databasePresent: true };
   } catch (error) {
     if (transactionOpen) {
       try {

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { addAccount, useAccount } from "../src/auth-service.js";
+import { addAccount, useAccount } from "../src/accounts.js";
 import { getStatus, runSwitch } from "../src/service.js";
 
 function jwt(payload) {
@@ -47,7 +47,7 @@ async function readDir(dirPath) {
 test("switch and status work without config.toml", async (t) => {
   const { codexHome, authPath } = await setup(t, "cx-switch-noconfig-");
 
-  const result = await runSwitch({ codexHome, identifier: "one@example.com", useAccountFn: useAccount });
+  const result = await runSwitch({ codexHome, identifier: "one@example.com" });
   assert.equal(result.targetProvider, "openai");
   assert.equal(await fs.readFile(authPath, "utf8"), oauthAuth("one"));
   assert.equal((await getStatus({ codexHome })).currentProvider, "openai");

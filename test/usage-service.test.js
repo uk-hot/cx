@@ -8,7 +8,7 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { accountKeyToFilename } from "../src/auth-service.js";
+import { accountKeyToFilename } from "../src/registry.js";
 import { getAccountUsage, renderUsage } from "../src/usage-service.js";
 
 const execFileAsync = promisify(execFile);
@@ -368,6 +368,29 @@ test("only the account Codex is logged in to is marked active", async (t) => {
   assert.equal(await activeFor(one.account_key, null), false);
   // A third-party provider leaves the previous ChatGPT tokens in auth.json.
   assert.equal(await activeFor(proxy.account_key, authFor("one")), false);
+});
+
+test("with a third-party provider in use, the official account is read from its snapshot", async (t) => {
+  const one = accountFor("one");
+  const proxy = accountFor("proxy", { provider: "my-proxy", auth_mode: "manual" });
+  const codexHome = await makeHome(t, {
+    accounts: [one, proxy],
+    active: proxy.account_key,
+    // A third-party provider leaves the earlier ChatGPT tokens in auth.json.
+    live: authFor("one", "left-behind-token"),
+    snapshots: { [one.account_key]: authFor("one", "snapshot-token") }
+  });
+  await fs.writeFile(path.join(codexHome, "config.toml"), "model_provider = \"my-proxy\"\n");
+  const tokens = [];
+
+  const [row] = await getAccountUsage(codexHome, {
+    fetchFn: async (url, init) => {
+      tokens.push(init.headers.Authorization);
+      return respondWith(usageBody());
+    }
+  });
+  assert.deepEqual(tokens, ["Bearer snapshot-token"]);
+  assert.equal(row.active, false);
 });
 
 test("accounts without an email or alias still get a name", async (t) => {

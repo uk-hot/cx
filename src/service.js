@@ -1,130 +1,51 @@
 import fs from "node:fs/promises";
-import path from "node:path";
 
-import { writeFileAtomically } from "./auth-service.js";
+import { useAccount } from "./accounts.js";
+import { readConfigText, readCurrentProviderFromConfigText } from "./config-file.js";
+import { DEFAULT_PROVIDER, SESSION_DIRS, codexPaths } from "./constants.js";
+import { errorMessage, formatFailures, restoreSnapshots, snapshotDirectory, snapshotFile } from "./fs-utils.js";
+import { withLock } from "./locking.js";
 import {
-  ACCOUNTS_DIR_NAME,
-  AUTH_FILE_NAME,
-  DEFAULT_PROVIDER,
-  defaultCodexHome
-} from "./constants.js";
-import {
-  readConfigText,
-  readCurrentProviderFromConfigText
-} from "./config-file.js";
-import { acquireLock } from "./locking.js";
-import {
+  RolloutRewriteError,
   applySessionChanges,
   collectSessionChanges,
   restoreSessionChanges,
   splitLockedSessionChanges,
   summarizeProviderCounts
 } from "./session-files.js";
-import {
-  assertSqliteWritable,
-  readSqliteProviderCounts,
-  updateSqliteProvider
-} from "./sqlite-state.js";
+import { assertSqliteWritable, readSqliteProviderCounts, updateSqliteProvider } from "./sqlite-state.js";
 import { ANSI, buildTable, colorEnabled, colorize } from "./terminal-ui.js";
 
-function normalizeCodexHome(explicitCodexHome) {
-  return path.resolve(explicitCodexHome ?? defaultCodexHome());
-}
+/** @typedef {import("./session-files.js").RolloutChange} RolloutChange */
+/** @typedef {Record<string, Record<string, number>>} CountsByScope */
 
-async function ensureCodexHome(codexHome) {
+/**
+ * @typedef {object} SyncResult
+ * @property {string} codexHome
+ * @property {string} targetProvider
+ * @property {number} changedSessionFiles
+ * @property {string[]} skippedLockedRolloutFiles rollouts left for a later sync because they were in use
+ * @property {number} sqliteRowsUpdated
+ * @property {boolean} sqlitePresent
+ */
+
+/** @param {string} codexHome */
+async function assertCodexHome(codexHome) {
   await fs.access(codexHome);
 }
 
-async function readTextFileSnapshot(filePath) {
-  try {
-    const [text, stat] = await Promise.all([fs.readFile(filePath, "utf8"), fs.stat(filePath)]);
-    return {
-      path: filePath,
-      exists: true,
-      text,
-      mode: stat.mode & 0o777
-    };
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return {
-        path: filePath,
-        exists: false,
-        text: null
-      };
-    }
-    throw error;
-  }
+/** @param {string} codexHome */
+async function readCurrentProvider(codexHome) {
+  return readCurrentProviderFromConfigText(await readConfigText(codexPaths(codexHome).config));
 }
 
-// Every file in a directory, plus the directory itself so files created later
-// can be told apart and removed on restore.
-async function readDirectorySnapshot(dirPath) {
-  let entries;
-  try {
-    entries = await fs.readdir(dirPath, { withFileTypes: true });
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      return { path: dirPath, files: [] };
-    }
-    throw error;
-  }
-  const files = await Promise.all(entries
-    .filter((entry) => entry.isFile())
-    .map((entry) => readTextFileSnapshot(path.join(dirPath, entry.name))));
-  return { path: dirPath, files };
-}
+/** @param {string[]} paths */
+const uniqueSorted = (paths) => [...new Set(paths)].sort((left, right) => left.localeCompare(right));
 
-async function restoreTextFileSnapshot(snapshot) {
-  if (snapshot.exists) {
-    await fs.mkdir(path.dirname(snapshot.path), { recursive: true });
-    // Atomic, so an interrupted restore cannot leave a truncated auth.json.
-    await writeFileAtomically(snapshot.path, snapshot.text, { mode: snapshot.mode });
-    return;
-  }
-  await fs.rm(snapshot.path, { force: true });
-}
-
-async function restoreTextFileSnapshots(snapshots, directorySnapshots = []) {
-  const failures = [];
-  const restore = async (filePath, action) => {
-    try {
-      await action();
-    } catch (error) {
-      failures.push({
-        path: filePath,
-        message: error.message
-      });
-    }
-  };
-
-  for (const snapshot of snapshots) {
-    await restore(snapshot.path, () => restoreTextFileSnapshot(snapshot));
-  }
-  for (const directory of directorySnapshots) {
-    const known = new Set(directory.files.map((file) => file.path));
-    const current = await fs.readdir(directory.path).catch(() => []);
-    for (const name of current) {
-      const filePath = path.join(directory.path, name);
-      if (!known.has(filePath)) {
-        await restore(filePath, () => fs.rm(filePath, { force: true }));
-      }
-    }
-    for (const snapshot of directory.files) {
-      await restore(snapshot.path, () => restoreTextFileSnapshot(snapshot));
-    }
-  }
-  return failures;
-}
-
-function formatRestoreFailures(failures) {
-  return failures
-    .map((failure) => `${failure.path}: ${failure.message}`)
-    .join("; ");
-}
-
+/** @param {CountsByScope | null} countsByScope */
 function buildCountRows(countsByScope) {
   const rows = [];
-  for (const scope of ["sessions", "archived_sessions"]) {
+  for (const scope of SESSION_DIRS) {
     const entries = Object.entries(countsByScope?.[scope] ?? {}).sort(([left], [right]) => left.localeCompare(right));
     if (!entries.length) {
       rows.push([scope, "(none)", "0"]);
@@ -137,237 +58,163 @@ function buildCountRows(countsByScope) {
   return rows;
 }
 
-export async function getStatus({ codexHome: explicitCodexHome } = {}) {
-  const codexHome = normalizeCodexHome(explicitCodexHome);
-  await ensureCodexHome(codexHome);
-  const configPath = path.join(codexHome, "config.toml");
-  const configText = await readConfigText(configPath);
-  const current = readCurrentProviderFromConfigText(configText);
-  const { providerCounts } = await collectSessionChanges(codexHome, null, {
-    statusOnly: true,
-    skipLockedReads: true
-  });
-  const sqliteCounts = await readSqliteProviderCounts(codexHome);
+/** @param {{ codexHome: string }} options */
+export async function getStatus({ codexHome }) {
+  await assertCodexHome(codexHome);
+  const current = await readCurrentProvider(codexHome);
+  const { providerCounts } = await collectSessionChanges(codexHome, null, { statusOnly: true });
 
   return {
     currentProvider: current.provider,
     currentProviderImplicit: current.implicit,
     rolloutCounts: summarizeProviderCounts(providerCounts),
-    sqliteCounts
+    sqliteCounts: await readSqliteProviderCounts(codexHome)
   };
 }
 
+/** @param {Awaited<ReturnType<typeof getStatus>>} status */
 export function renderStatus(status) {
   const enabled = colorEnabled();
-  const summaryRows = [
-    ["Current provider", `${status.currentProvider}${status.currentProviderImplicit ? " (implicit default)" : ""}`]
-  ];
-
-  const rolloutRows = buildCountRows(status.rolloutCounts);
+  /** @param {number} index @param {string} cell */
+  const providerColor = (index, cell) => (index === 1 && cell === status.currentProvider ? ANSI.green : null);
   const sqliteRows = status.sqliteCounts
     ? buildCountRows(status.sqliteCounts)
     : [["database", "state_5.sqlite not found", "-"]];
 
   return [
     colorize("STATUS", ANSI.cyan, enabled),
-    buildTable(["FIELD", "VALUE"], summaryRows, {
-      cellColor: (index, cell) => {
-        if (index !== 1) {
-          return null;
-        }
-        if (cell.startsWith(status.currentProvider)) {
-          return ANSI.green;
-        }
-        if (cell.includes("not found")) {
-          return ANSI.yellow;
-        }
-        return null;
-      }
+    buildTable(["FIELD", "VALUE"], [
+      ["Current provider", `${status.currentProvider}${status.currentProviderImplicit ? " (implicit default)" : ""}`]
+    ], {
+      cellColor: (index, cell) => (index === 1 && cell.startsWith(status.currentProvider) ? ANSI.green : null)
     }),
     "",
     colorize("ROLLOUT FILES", ANSI.cyan, enabled),
-    buildTable(["LOCATION", "PROVIDER", "COUNT"], rolloutRows, {
-      cellColor: (index, cell) => (index === 1 && cell === status.currentProvider ? ANSI.green : null)
-    }),
+    buildTable(["LOCATION", "PROVIDER", "COUNT"], buildCountRows(status.rolloutCounts), { cellColor: providerColor }),
     "",
     colorize("SQLITE STATE", ANSI.cyan, enabled),
     buildTable(["LOCATION", "PROVIDER", "COUNT"], sqliteRows, {
-      cellColor: (index, cell) => {
-        if (cell.includes("not found")) {
-          return ANSI.yellow;
-        }
-        if (index === 1 && cell === status.currentProvider) {
-          return ANSI.green;
-        }
-        return null;
-      }
+      cellColor: (index, cell) => (cell.includes("not found") ? ANSI.yellow : providerColor(index, cell))
     })
   ].join("\n");
 }
 
-async function restoreAppliedOrThrow(appliedChanges, causeError) {
-  if (!appliedChanges.length) {
-    return;
-  }
+/**
+ * Rolls rewritten rollouts back after a failure, then rethrows the failure.
+ * @param {RolloutChange[]} appliedChanges
+ * @param {unknown} causeError
+ * @returns {Promise<never>}
+ */
+async function restoreAndThrow(appliedChanges, causeError) {
   try {
-    await restoreSessionChanges(appliedChanges.map((change) => ({
-      path: change.path,
-      originalFirstLine: change.originalFirstLine,
-      originalSeparator: change.originalSeparator
-    })));
+    await restoreSessionChanges(appliedChanges);
   } catch (restoreError) {
     throw new Error(
-      `Failed to restore rollout files after sync error. Original error: ${causeError.message}. Restore error: ${restoreError.message}`
+      `Failed to restore rollout files after sync error (${errorMessage(causeError)}). ${errorMessage(restoreError)}`,
+      { cause: causeError }
     );
   }
+  throw causeError;
 }
 
-async function runSyncLocked({
-  codexHome,
-  provider,
-  sqliteBusyTimeoutMs
-}) {
-  const configPath = path.join(codexHome, "config.toml");
-  const configText = await readConfigText(configPath);
-  const current = readCurrentProviderFromConfigText(configText);
-  const targetProvider = provider ?? current.provider ?? DEFAULT_PROVIDER;
+/**
+ * Moves every rollout and thread row to the target provider and clears their
+ * account scope. Rollouts first, then one short SQLite transaction; a failure
+ * in either rolls the rewritten rollouts back. Callers must hold the cx lock.
+ * @param {{ codexHome: string, provider?: string }} options
+ * @returns {Promise<SyncResult>}
+ */
+async function runSyncLocked({ codexHome, provider }) {
+  const targetProvider = provider ?? (await readCurrentProvider(codexHome)).provider ?? DEFAULT_PROVIDER;
 
-  const {
-    changes,
-    lockedPaths: lockedReadPaths,
-    providerCounts
-  } = await collectSessionChanges(codexHome, targetProvider, { skipLockedReads: true });
-  const {
-    writableChanges,
-    lockedChanges
-  } = await splitLockedSessionChanges(changes);
-  const skippedRolloutFiles = [...new Set([
-    ...lockedReadPaths,
-    ...lockedChanges.map((change) => change.path)
-  ])].sort((left, right) => left.localeCompare(right));
+  const { changes, lockedPaths } = await collectSessionChanges(codexHome, targetProvider);
+  const { writableChanges, lockedChanges } = await splitLockedSessionChanges(codexHome, changes);
 
   // Verify the database is writable before rewriting any rollout file, so we
   // do not touch files only to discover the database is locked afterwards.
-  await assertSqliteWritable(codexHome, { busyTimeoutMs: sqliteBusyTimeoutMs });
+  await assertSqliteWritable(codexHome);
 
-  // 1) Rewrite rollout files first, outside of any SQLite transaction, so the
-  //    database write lock (step 2) stays short regardless of file count.
-  let applyResult;
+  /** @param {string[]} paths */
+  const changesAt = (paths) => {
+    const pathSet = new Set(paths);
+    return writableChanges.filter((change) => pathSet.has(change.path));
+  };
+
+  let applied;
   try {
-    applyResult = await applySessionChanges(writableChanges);
+    applied = await applySessionChanges(writableChanges);
   } catch (error) {
-    const appliedPathSet = new Set(error.appliedPaths ?? []);
-    await restoreAppliedOrThrow(
-      writableChanges.filter((change) => appliedPathSet.has(change.path)),
-      error
-    );
-    throw error;
+    return restoreAndThrow(changesAt(error instanceof RolloutRewriteError ? error.appliedPaths : []), error);
   }
-  const appliedPathSet = new Set(applyResult.appliedPaths);
-  const appliedSessionChanges = writableChanges.filter((change) => appliedPathSet.has(change.path));
 
-  const skippedLockedRolloutFiles = [...new Set([
-    ...skippedRolloutFiles,
-    ...applyResult.skippedPaths
-  ])].sort((left, right) => left.localeCompare(right));
-  const changeByPath = new Map(changes.map((change) => [change.path, change]));
+  const skippedLockedRolloutFiles = uniqueSorted([
+    ...lockedPaths,
+    ...lockedChanges.map((change) => change.path),
+    ...applied.skippedPaths
+  ]);
+  const threadIdByPath = new Map(changes.map((change) => [change.path, change.threadId]));
   const skippedThreadIds = skippedLockedRolloutFiles
-    .map((filePath) => changeByPath.get(filePath)?.threadId)
-    .filter(Boolean);
+    .map((filePath) => threadIdByPath.get(filePath))
+    .filter((threadId) => typeof threadId === "string");
 
-  // 2) Update SQLite in a short transaction. On failure, roll the rewritten
-  //    rollout files back so both stores stay consistent.
   let sqliteResult;
   try {
     sqliteResult = await updateSqliteProvider(codexHome, targetProvider, {
-      busyTimeoutMs: sqliteBusyTimeoutMs,
       skippedThreadIds,
       skippedRolloutPaths: skippedLockedRolloutFiles
     });
   } catch (error) {
-    await restoreAppliedOrThrow(appliedSessionChanges, error);
-    throw error;
+    return restoreAndThrow(changesAt(applied.appliedPaths), error);
   }
 
   return {
     codexHome,
     targetProvider,
-    previousProvider: current.provider,
-    changedSessionFiles: applyResult.appliedChanges,
+    changedSessionFiles: applied.appliedPaths.length,
     skippedLockedRolloutFiles,
     sqliteRowsUpdated: sqliteResult.updatedRows,
-    sqlitePresent: sqliteResult.databasePresent,
-    rolloutCountsBefore: summarizeProviderCounts(providerCounts)
+    sqlitePresent: sqliteResult.databasePresent
   };
 }
 
-export async function runSync({
-  codexHome: explicitCodexHome,
-  provider,
-  sqliteBusyTimeoutMs
-} = {}) {
-  const codexHome = normalizeCodexHome(explicitCodexHome);
-  await ensureCodexHome(codexHome);
-
-  const releaseLock = await acquireLock(codexHome, "sync");
-  try {
-    return await runSyncLocked({ codexHome, provider, sqliteBusyTimeoutMs });
-  } finally {
-    await releaseLock();
-  }
+/** @param {{ codexHome: string, provider?: string }} options */
+export async function runSync({ codexHome, provider }) {
+  await assertCodexHome(codexHome);
+  return withLock(codexHome, "sync", () => runSyncLocked({ codexHome, provider }));
 }
 
-export async function runSwitch({
-  codexHome: explicitCodexHome,
-  identifier,
-  useAccountFn
-}) {
+/**
+ * Switches the login to a registered account and syncs the sessions to its
+ * provider. Snapshots auth.json, config.toml and the accounts directory first,
+ * and puts them back if either step fails.
+ * @param {{ codexHome: string, identifier: string | undefined, useAccountFn?: typeof useAccount }} options
+ */
+export async function runSwitch({ codexHome, identifier, useAccountFn = useAccount }) {
   if (!identifier) {
     throw new Error("Missing account identifier. Usage: cx switch <email|alias>");
   }
-  if (!useAccountFn) {
-    throw new Error("useAccountFn is required for switch.");
-  }
+  await assertCodexHome(codexHome);
+  const paths = codexPaths(codexHome);
 
-  const codexHome = normalizeCodexHome(explicitCodexHome);
-  await ensureCodexHome(codexHome);
-
-  const releaseLock = await acquireLock(codexHome, "switch");
-  try {
-    const configPath = path.join(codexHome, "config.toml");
-    const authPath = path.join(codexHome, AUTH_FILE_NAME);
-    const snapshots = await Promise.all([
-      readTextFileSnapshot(configPath),
-      readTextFileSnapshot(authPath)
-    ]);
-    // The registry and the account snapshots: a switch refreshes the outgoing
-    // account's snapshots and may register the live login with new ones.
-    const accountsSnapshot = await readDirectorySnapshot(path.join(codexHome, ACCOUNTS_DIR_NAME));
+  return withLock(codexHome, "switch", async () => {
+    const files = await Promise.all([snapshotFile(paths.config), snapshotFile(paths.auth)]);
+    // A switch refreshes the outgoing account's snapshots and may register the
+    // live login with new ones.
+    const accounts = await snapshotDirectory(paths.accounts);
 
     try {
-      const useResult = await useAccountFn(codexHome, identifier);
-      const newConfigText = await readConfigText(configPath);
-      const { provider: newProvider } = readCurrentProviderFromConfigText(newConfigText);
-
-      const syncResult = await runSyncLocked({
-        codexHome,
-        provider: newProvider
-      });
-      return {
-        ...syncResult,
-        configUpdated: true,
-        switchedAccount: useResult
-      };
+      const switchedAccount = await useAccountFn(codexHome, identifier);
+      const { provider } = await readCurrentProvider(codexHome);
+      return { ...await runSyncLocked({ codexHome, provider }), switchedAccount };
     } catch (error) {
-      const restoreFailures = await restoreTextFileSnapshots(snapshots, [accountsSnapshot]);
+      const restoreFailures = await restoreSnapshots(files, [accounts]);
       if (restoreFailures.length > 0) {
         throw new Error(
-          `Failed to restore switch state after sync error. Original error: ${error.message}. Restore error(s): ${formatRestoreFailures(restoreFailures)}`
+          `Failed to restore switch state after sync error (${errorMessage(error)}). Restore error(s): ${formatFailures(restoreFailures)}`,
+          { cause: error }
         );
       }
       throw error;
     }
-  } finally {
-    await releaseLock();
-  }
+  });
 }

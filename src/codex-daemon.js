@@ -5,6 +5,12 @@ const DAEMON_COMMAND_TIMEOUT_MS = 30000;
 
 // Runs `codex app-server daemon <command>` against this home and collects its
 // output. A command that hangs is killed and reported with a null exit code.
+/**
+ * @param {string} codexHome
+ * @param {string} command
+ * @param {number} timeoutMs
+ * @returns {Promise<{ code: number | null, output: string }>}
+ */
 function runDaemonCommand(codexHome, command, timeoutMs) {
   return new Promise((resolve, reject) => {
     const child = spawn("codex", ["app-server", "daemon", command], {
@@ -33,6 +39,7 @@ function runDaemonCommand(codexHome, command, timeoutMs) {
 }
 
 // The daemon prints progress events as JSON lines before its final status line.
+/** @param {string} output */
 function lastStatus(output) {
   for (const line of output.split(/\r?\n/).reverse()) {
     try {
@@ -47,6 +54,7 @@ function lastStatus(output) {
   return null;
 }
 
+/** @param {string} output */
 function lastLine(output) {
   return output.trim().split(/\r?\n/).at(-1) ?? "";
 }
@@ -55,12 +63,17 @@ function lastLine(output) {
 // reads auth.json only when it starts. After the login changes it keeps using
 // the previous account until it is restarted. A daemon that isn't running (or
 // a Codex without one) needs nothing, so this never starts a new one.
+/**
+ * @param {string} codexHome
+ * @param {{ timeoutMs?: number }} [options]
+ * @returns {Promise<{ status: "restarted" | "not-running" } | { status: "failed", detail: string }>}
+ */
 export async function restartCodexDaemon(codexHome, { timeoutMs = DAEMON_COMMAND_TIMEOUT_MS } = {}) {
   let version;
   try {
     version = await runDaemonCommand(codexHome, "version", timeoutMs);
   } catch (error) {
-    if (error?.code === "ENOENT") {
+    if (/** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT") {
       return { status: "not-running" };
     }
     throw error;

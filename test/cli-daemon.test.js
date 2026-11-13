@@ -8,7 +8,7 @@ import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
 
-import { accountKeyToConfigFilename } from "../src/auth-service.js";
+import { accountKeyToConfigFilename } from "../src/registry.js";
 import { restartCodexDaemon } from "../src/codex-daemon.js";
 
 const execFileAsync = promisify(execFile);

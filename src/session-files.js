@@ -1,99 +1,135 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 
-import { ACCOUNT_SCOPE_KEYS, SESSION_DIRS } from "./constants.js";
+import { ACCOUNT_SCOPE_KEYS, SESSION_DIRS, codexPaths } from "./constants.js";
+import { errorMessage, fileExists, formatFailures, isNotFound, temporaryPathFor } from "./fs-utils.js";
 
 const execFileAsync = promisify(execFile);
+const IS_WINDOWS = process.platform === "win32";
+// libuv's UV_FS_O_EXLOCK, which Node does not export: on Windows the file is
+// opened without sharing, so the open fails with EBUSY while any other process
+// has it open, and nothing else can open it while cx holds it.
+const UV_FS_O_EXLOCK = 0x10000000;
+const EXCLUSIVE_OPEN_FLAGS = fs.constants.O_RDWR | UV_FS_O_EXLOCK;
 
-function isRolloutFileBusyError(error) {
-  const message = `${error?.code ?? ""} ${error?.message ?? ""}`.toLowerCase();
-  return message.includes("ebusy")
-    || message.includes("resource busy or locked")
-    || message.includes("being used by another process")
-    || message.includes("currently in use")
-    || message.includes("eperm");
+/**
+ * A rollout whose session_meta header needs rewriting, as it was when collected.
+ * @typedef {object} RolloutChange
+ * @property {string} path
+ * @property {string | null} threadId
+ * @property {string} originalFirstLine
+ * @property {string} originalSeparator "\n", "\r\n", or "" for a file without one
+ * @property {number} originalOffset byte offset of the second line
+ * @property {number} originalSize
+ * @property {number} originalMtimeMs
+ * @property {string} updatedFirstLine
+ */
+
+/**
+ * @typedef {{ firstLine: string, separator: string, offset: number }} FirstLineRecord
+ * @typedef {"applied" | "busy" | "changed" | "missing"} RewriteStatus
+ * @typedef {Record<(typeof SESSION_DIRS)[number], Map<string, number>>} ProviderCounts
+ */
+
+/** Thrown by applySessionChanges, with the files already rewritten so they can be rolled back. */
+export class RolloutRewriteError extends Error {
+  /**
+   * @param {string} message
+   * @param {{ appliedPaths: string[], cause: unknown }} details
+   */
+  constructor(message, { appliedPaths, cause }) {
+    super(message, { cause });
+    this.name = "RolloutRewriteError";
+    this.appliedPaths = appliedPaths;
+  }
 }
 
+// EPERM means "in use" only on Windows, where an open handle blocks a replace;
+// elsewhere it is a real permission problem and must not be skipped as busy.
+/** @param {unknown} error */
+function isRolloutFileBusyError(error) {
+  const code = /** @type {NodeJS.ErrnoException} */ (error)?.code;
+  return code === "EBUSY" || (IS_WINDOWS && code === "EPERM");
+}
+
+/**
+ * @param {unknown} error
+ * @param {string} filePath
+ * @param {string} action
+ */
 function wrapRolloutFileBusyError(error, filePath, action) {
   if (!isRolloutFileBusyError(error)) {
     return error;
   }
   return new Error(
-    `Unable to ${action} rollout file because it is currently in use. Close Codex and the Codex app, then retry. Locked file: ${filePath}`
+    `Unable to ${action} rollout file because it is currently in use. Close Codex and the Codex app, then retry. Locked file: ${filePath}`,
+    { cause: error }
   );
 }
 
-async function getFileSnapshot(filePath) {
-  const stat = await fsp.stat(filePath);
-  return {
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-    mode: stat.mode & 0o777
-  };
+/**
+ * @param {Pick<RolloutChange, "originalSize" | "originalMtimeMs">} change
+ * @param {fs.Stats} stat
+ */
+function matchesCollected(change, stat) {
+  return change.originalSize === stat.size && change.originalMtimeMs === stat.mtimeMs;
 }
 
-function snapshotMatches(change, snapshot) {
-  return change.originalSize === snapshot.size
-    && change.originalMtimeMs === snapshot.mtimeMs;
+/** @param {string} rootDir */
+async function listRolloutFiles(rootDir) {
+  const entries = await fsp.readdir(rootDir, { recursive: true, withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isFile() && entry.name.startsWith("rollout-") && entry.name.endsWith(".jsonl"))
+    .map((entry) => path.join(entry.parentPath, entry.name));
 }
 
-async function listJsonlFiles(rootDir) {
-  const entries = await fsp.readdir(rootDir, { withFileTypes: true });
-  const files = [];
-  for (const entry of entries) {
-    const fullPath = path.join(rootDir, entry.name);
-    if (entry.isDirectory()) {
-      files.push(...(await listJsonlFiles(fullPath)));
-      continue;
+/**
+ * Reads up to the first newline only: rollouts can be large.
+ * @param {fsp.FileHandle} handle
+ * @returns {Promise<FirstLineRecord>}
+ */
+async function readFirstLine(handle) {
+  const chunks = [];
+  let position = 0;
+  while (true) {
+    const chunk = Buffer.alloc(64 * 1024);
+    const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+    if (bytesRead === 0) {
+      break;
     }
-    if (entry.isFile() && entry.name.startsWith("rollout-") && entry.name.endsWith(".jsonl")) {
-      files.push(fullPath);
+    chunks.push(chunk.subarray(0, bytesRead));
+    const newlineIndex = chunk.subarray(0, bytesRead).indexOf(0x0a);
+    if (newlineIndex !== -1) {
+      const collected = Buffer.concat(chunks);
+      const lineEnd = position + newlineIndex;
+      const crlf = lineEnd > 0 && collected[lineEnd - 1] === 0x0d;
+      return {
+        firstLine: collected.subarray(0, crlf ? lineEnd - 1 : lineEnd).toString("utf8"),
+        separator: crlf ? "\r\n" : "\n",
+        offset: lineEnd + 1
+      };
     }
+    position += bytesRead;
   }
-  return files;
+  const collected = Buffer.concat(chunks);
+  return { firstLine: collected.toString("utf8"), separator: "", offset: collected.length };
 }
 
+/** @param {string} filePath */
 async function readFirstLineRecord(filePath) {
-  let handle;
+  const handle = await fsp.open(filePath, "r");
   try {
-    handle = await fsp.open(filePath, "r");
-    let position = 0;
-    let collected = Buffer.alloc(0);
-    while (true) {
-      const chunk = Buffer.alloc(64 * 1024);
-      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
-      if (bytesRead === 0) {
-        break;
-      }
-      position += bytesRead;
-      collected = Buffer.concat([collected, chunk.subarray(0, bytesRead)]);
-      const newlineIndex = collected.indexOf(0x0a);
-      if (newlineIndex !== -1) {
-        const crlf = newlineIndex > 0 && collected[newlineIndex - 1] === 0x0d;
-        const lineBuffer = crlf ? collected.subarray(0, newlineIndex - 1) : collected.subarray(0, newlineIndex);
-        return {
-          firstLine: lineBuffer.toString("utf8"),
-          separator: crlf ? "\r\n" : "\n",
-          offset: newlineIndex + 1
-        };
-      }
-    }
-    return {
-      firstLine: collected.toString("utf8"),
-      separator: "",
-      offset: collected.length
-    };
-  } catch (error) {
-    throw wrapRolloutFileBusyError(error, filePath, "read");
+    return await readFirstLine(handle);
   } finally {
-    await handle?.close();
+    await handle.close();
   }
 }
 
+/** @param {string} firstLine */
 function parseSessionMetaRecord(firstLine) {
   if (!firstLine) {
     return null;
@@ -112,148 +148,104 @@ function parseSessionMetaRecord(firstLine) {
 // Codex 0.168+ tags new threads with their creator and lists only the current
 // login's account-scoped threads. Absent keys mean "shared with every account",
 // the state of threads created before the tagging.
+/** @param {Record<string, unknown>} payload */
 function hasAccountScope(payload) {
   return ACCOUNT_SCOPE_KEYS.some((key) => Object.hasOwn(payload, key));
 }
 
+/** @param {Record<string, unknown>} payload */
 function clearAccountScope(payload) {
   for (const key of ACCOUNT_SCOPE_KEYS) {
     delete payload[key];
   }
 }
 
-async function rewriteFirstLine(filePath, nextFirstLine, separator) {
-  const { mode } = await getFileSnapshot(filePath);
-  const current = await readFirstLineRecord(filePath);
-  const tmpPath = `${filePath}.provider-sync.${process.pid}.${Date.now()}.tmp`;
-  const writer = fs.createWriteStream(tmpPath, { encoding: "utf8", mode: 0o600 });
-
-  try {
-    await new Promise((resolve, reject) => {
-      writer.on("error", reject);
-      writer.write(nextFirstLine);
-      if (separator) {
-        writer.write(separator);
-      }
-
-      const headerOnly =
-        current.separator === "" &&
-        current.offset === Buffer.byteLength(current.firstLine, "utf8");
-
-      if (headerOnly) {
-        writer.end();
-        writer.once("finish", resolve);
-        return;
-      }
-
-      const reader = fs.createReadStream(filePath, { start: current.offset });
-      reader.on("error", reject);
-      reader.on("end", () => writer.end());
-      writer.once("finish", resolve);
-      reader.pipe(writer, { end: false });
-    });
-
-    await fsp.chmod(tmpPath, mode);
-    await fsp.rename(tmpPath, filePath);
-  } catch (error) {
-    await fsp.rm(tmpPath, { force: true });
-    throw wrapRolloutFileBusyError(error, filePath, "rewrite");
-  }
+/**
+ * Opens a rollout to rewrite it. On Windows the open is exclusive, which both
+ * detects a running Codex and keeps it out until the rewrite is done.
+ * @param {string} filePath
+ */
+function openForRewrite(filePath) {
+  return fsp.open(filePath, IS_WINDOWS ? EXCLUSIVE_OPEN_FLAGS : "r");
 }
 
-async function tryRewriteCollectedFirstLine(change) {
-  const beforeSnapshot = await getFileSnapshot(change.path);
-  if (!snapshotMatches(change, beforeSnapshot)) {
-    return false;
-  }
-
-  const current = await readFirstLineRecord(change.path);
-  if (current.firstLine !== change.originalFirstLine || current.offset !== change.originalOffset) {
-    return false;
-  }
-
-  const tmpPath = `${change.path}.provider-sync.${process.pid}.${Date.now()}.tmp`;
-  const writer = fs.createWriteStream(tmpPath, { encoding: "utf8", mode: 0o600 });
-
+/**
+ * Replaces a rollout's first line by writing a temporary copy and renaming it
+ * over the original, keeping the file's mode. With `expected`, the file is left
+ * alone ("changed") unless it is still exactly as collected.
+ * @param {string} filePath
+ * @param {string} firstLine
+ * @param {string} separator
+ * @param {RolloutChange} [expected]
+ * @returns {Promise<RewriteStatus>}
+ */
+async function replaceFirstLine(filePath, firstLine, separator, expected) {
+  /** @type {fsp.FileHandle | null} */
+  let source;
   try {
-    await new Promise((resolve, reject) => {
-      writer.on("error", reject);
-      writer.write(change.updatedFirstLine);
-      if (change.originalSeparator) {
-        writer.write(change.originalSeparator);
-      }
+    source = await openForRewrite(filePath);
+  } catch (error) {
+    if (isNotFound(error)) {
+      return "missing";
+    }
+    if (isRolloutFileBusyError(error)) {
+      return "busy";
+    }
+    throw error;
+  }
 
-      const headerOnly = change.originalOffset >= change.originalSize;
-      if (headerOnly) {
-        writer.end();
-        writer.once("finish", resolve);
-        return;
-      }
-
-      const reader = fs.createReadStream(change.path, { start: change.originalOffset });
-      reader.on("error", reject);
-      reader.on("end", () => writer.end());
-      writer.once("finish", resolve);
-      reader.pipe(writer, { end: false });
-    });
-
-    const afterSnapshot = await getFileSnapshot(change.path);
-    if (!snapshotMatches(change, afterSnapshot)) {
-      await fsp.rm(tmpPath, { force: true });
-      return false;
+  const temporaryPath = temporaryPathFor(filePath);
+  try {
+    const stat = await source.stat();
+    if (expected && !matchesCollected(expected, stat)) {
+      return "changed";
+    }
+    const current = await readFirstLine(source);
+    if (expected && (current.firstLine !== expected.originalFirstLine || current.offset !== expected.originalOffset)) {
+      return "changed";
     }
 
-    await fsp.chmod(tmpPath, beforeSnapshot.mode);
-    await fsp.rename(tmpPath, change.path);
-    return true;
-  } catch (error) {
-    await fsp.rm(tmpPath, { force: true });
-    throw wrapRolloutFileBusyError(error, change.path, "rewrite");
-  }
-}
+    const rest = current.offset < stat.size
+      ? source.createReadStream({ start: current.offset, autoClose: false })
+      : null;
+    await pipeline(
+      async function* () {
+        yield Buffer.from(`${firstLine}${separator}`, "utf8");
+        if (rest) {
+          yield* rest;
+        }
+      },
+      fs.createWriteStream(temporaryPath, { flags: "wx", mode: 0o600 })
+    );
 
-async function findLockedFilesOnWindows(filePaths) {
-  if (!filePaths.length) {
-    return [];
-  }
-  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-provider-locks-"));
-  const manifestPath = path.join(tempDir, "paths.json");
-  const script = `
-& {
-  param([string]$manifestPath)
-  $paths = Get-Content -Raw -Path $manifestPath | ConvertFrom-Json
-  foreach ($path in $paths) {
+    // POSIX has no mandatory locks: Codex may have appended during the copy.
+    if (expected && !matchesCollected(expected, await fsp.stat(filePath))) {
+      return "changed";
+    }
+
+    // Windows cannot replace a file that is still open, even by cx itself.
+    await source.close();
+    source = null;
+    await fsp.chmod(temporaryPath, stat.mode & 0o777);
     try {
-      $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-      $stream.Close()
-    } catch {
-      Write-Output $path
+      await fsp.rename(temporaryPath, filePath);
+    } catch (error) {
+      // Opened again between the close and the rename: the file is untouched.
+      if (isRolloutFileBusyError(error)) {
+        return "busy";
+      }
+      throw error;
     }
-  }
-}
-`.trim();
-
-  try {
-    await fsp.writeFile(manifestPath, JSON.stringify(filePaths), "utf8");
-    const { stdout } = await execFileAsync("powershell.exe", [
-      "-NoProfile",
-      "-ExecutionPolicy",
-      "Bypass",
-      "-Command",
-      script,
-      manifestPath
-    ]);
-    return stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean);
+    return "applied";
   } catch (error) {
-    throw new Error(`Unable to verify rollout file locks on Windows. ${error.message}`);
+    throw wrapRolloutFileBusyError(error, filePath, "rewrite");
   } finally {
-    await fsp.rm(tempDir, { recursive: true, force: true });
+    await source?.close();
+    await fsp.rm(temporaryPath, { force: true });
   }
 }
 
+/** @param {string[]} filePaths */
 async function realpathMap(filePaths) {
   const byRealPath = new Map();
   for (const filePath of filePaths) {
@@ -262,7 +254,28 @@ async function realpathMap(filePaths) {
   return byRealPath;
 }
 
-// Linux: a rollout is in use when any process holds a descriptor to it.
+/**
+ * Windows: a rollout is in use when it cannot be opened exclusively.
+ * @param {string[]} filePaths
+ */
+async function findOpenFilesOnWindows(filePaths) {
+  const openPaths = [];
+  for (const filePath of filePaths) {
+    try {
+      await (await fsp.open(filePath, EXCLUSIVE_OPEN_FLAGS)).close();
+    } catch (error) {
+      if (!isNotFound(error)) {
+        openPaths.push(filePath);
+      }
+    }
+  }
+  return openPaths;
+}
+
+/**
+ * Linux: a rollout is in use when any process holds a descriptor to it.
+ * @param {string[]} filePaths
+ */
 async function findOpenFilesOnLinux(filePaths) {
   const byRealPath = await realpathMap(filePaths);
   const openPaths = new Set();
@@ -275,13 +288,8 @@ async function findOpenFilesOnLinux(filePaths) {
       continue;
     }
     for (const descriptor of descriptors) {
-      let target;
-      try {
-        target = await fsp.readlink(`/proc/${pid}/fd/${descriptor}`);
-      } catch {
-        continue;
-      }
-      const filePath = byRealPath.get(target);
+      const target = await fsp.readlink(`/proc/${pid}/fd/${descriptor}`).catch(() => null);
+      const filePath = target && byRealPath.get(target);
       if (filePath) {
         openPaths.add(filePath);
       }
@@ -290,7 +298,10 @@ async function findOpenFilesOnLinux(filePaths) {
   return [...openPaths];
 }
 
-// macOS and other POSIX systems without /proc: ask lsof.
+/**
+ * macOS and other POSIX systems without /proc: ask lsof.
+ * @param {string[]} filePaths
+ */
 async function findOpenFilesWithLsof(filePaths) {
   const byRealPath = await realpathMap(filePaths);
   const openPaths = new Set();
@@ -302,11 +313,12 @@ async function findOpenFilesWithLsof(filePaths) {
         maxBuffer: 16 * 1024 * 1024
       }));
     } catch (error) {
+      const failure = /** @type {{ code?: unknown, stdout?: string }} */ (error);
       // lsof exits 1 when some of the listed files are not open.
-      if (typeof error?.code !== "number") {
-        throw new Error(`Unable to verify whether rollout files are in use (lsof). ${error.message}`);
+      if (typeof failure?.code !== "number") {
+        throw new Error("Unable to verify whether rollout files are in use (lsof).", { cause: error });
       }
-      stdout = error.stdout ?? "";
+      stdout = failure.stdout ?? "";
     }
     for (const line of stdout.split(/\r?\n/)) {
       const filePath = line.startsWith("n") ? byRealPath.get(line.slice(1)) : null;
@@ -318,15 +330,16 @@ async function findOpenFilesWithLsof(filePaths) {
   return [...openPaths];
 }
 
-// Rewrites replace the rollout file, so a running Codex that still has it open
-// would keep appending to the replaced file and lose those events. Report such
-// files as locked on every platform.
-async function findOpenRolloutFiles(filePaths) {
+/**
+ * The paths among `filePaths` that another process has open.
+ * @param {string[]} filePaths
+ */
+async function findOpenFiles(filePaths) {
   if (!filePaths.length) {
     return [];
   }
-  if (process.platform === "win32") {
-    return findLockedFilesOnWindows(filePaths);
+  if (IS_WINDOWS) {
+    return findOpenFilesOnWindows(filePaths);
   }
   if (process.platform === "linux") {
     return findOpenFilesOnLinux(filePaths);
@@ -334,29 +347,37 @@ async function findOpenRolloutFiles(filePaths) {
   return findOpenFilesWithLsof(filePaths);
 }
 
-export async function collectSessionChanges(codexHome, targetProvider, options = {}) {
-  const {
-    skipLockedReads = false,
-    statusOnly = false
-  } = options;
-  const summaries = [];
+/**
+ * Reads every rollout's header: counts its provider, and, unless `statusOnly`,
+ * records the change that moves it to `targetProvider` and clears its account
+ * scope. Files another process has locked for reading are listed, not read.
+ * @param {string} codexHome
+ * @param {string | null} targetProvider
+ * @param {{ statusOnly?: boolean }} [options]
+ */
+export async function collectSessionChanges(codexHome, targetProvider, { statusOnly = false } = {}) {
+  /** @type {RolloutChange[]} */
+  const changes = [];
+  /** @type {string[]} */
   const lockedPaths = [];
-  const providerCounts = Object.fromEntries(SESSION_DIRS.map((dirName) => [dirName, new Map()]));
+  const providerCounts = /** @type {ProviderCounts} */ (Object.fromEntries(SESSION_DIRS.map((dirName) => [dirName, new Map()])));
 
   for (const dirName of SESSION_DIRS) {
-    const rootDir = path.join(codexHome, dirName);
+    let rolloutPaths;
     try {
-      await fsp.access(rootDir);
-    } catch {
-      continue;
+      rolloutPaths = await listRolloutFiles(path.join(codexHome, dirName));
+    } catch (error) {
+      if (isNotFound(error)) {
+        continue;
+      }
+      throw error;
     }
-    const rolloutPaths = await listJsonlFiles(rootDir);
     for (const rolloutPath of rolloutPaths) {
       let record;
       try {
         record = await readFirstLineRecord(rolloutPath);
       } catch (error) {
-        if (skipLockedReads && isRolloutFileBusyError(error)) {
+        if (isRolloutFileBusyError(error)) {
           lockedPaths.push(rolloutPath);
           continue;
         }
@@ -367,395 +388,125 @@ export async function collectSessionChanges(codexHome, targetProvider, options =
         continue;
       }
       const currentProvider = parsed.payload.model_provider ?? "(missing)";
-      providerCounts[dirName].set(currentProvider, (providerCounts[dirName].get(currentProvider) ?? 0) + 1);
+      const counts = providerCounts[dirName];
+      counts.set(currentProvider, (counts.get(currentProvider) ?? 0) + 1);
 
-      if (!statusOnly && (parsed.payload.model_provider !== targetProvider || hasAccountScope(parsed.payload))) {
-        const snapshot = await getFileSnapshot(rolloutPath);
-        parsed.payload.model_provider = targetProvider;
-        clearAccountScope(parsed.payload);
-        summaries.push({
-          path: rolloutPath,
-          threadId: parsed.payload.id ?? null,
-          directory: dirName,
-          originalFirstLine: record.firstLine,
-          originalSeparator: record.separator,
-          originalOffset: record.offset,
-          originalSize: snapshot.size,
-          originalMtimeMs: snapshot.mtimeMs,
-          updatedFirstLine: JSON.stringify(parsed)
-        });
+      if (statusOnly || (parsed.payload.model_provider === targetProvider && !hasAccountScope(parsed.payload))) {
+        continue;
       }
+      const stat = await fsp.stat(rolloutPath);
+      parsed.payload.model_provider = targetProvider;
+      clearAccountScope(parsed.payload);
+      changes.push({
+        path: rolloutPath,
+        threadId: parsed.payload.id ?? null,
+        originalFirstLine: record.firstLine,
+        originalSeparator: record.separator,
+        originalOffset: record.offset,
+        originalSize: stat.size,
+        originalMtimeMs: stat.mtimeMs,
+        updatedFirstLine: JSON.stringify(parsed)
+      });
     }
   }
 
-  return { changes: summaries, lockedPaths, providerCounts };
+  return { changes, lockedPaths, providerCounts };
 }
 
-const WINDOWS_BATCH_REWRITE_SCRIPT = `
-& {
-  param([string]$manifestPath)
+/** @param {string[]} paths */
+const sorted = (paths) => paths.sort((left, right) => left.localeCompare(right));
 
-  function Read-FirstLineRecord([System.IO.FileStream]$stream) {
-    $stream.Seek(0, [System.IO.SeekOrigin]::Begin) | Out-Null
-    $buffer = New-Object byte[] (64 * 1024)
-    $collected = New-Object System.IO.MemoryStream
-    try {
-      while ($true) {
-        $bytesRead = $stream.Read($buffer, 0, $buffer.Length)
-        if ($bytesRead -le 0) {
-          break
-        }
-
-        $collected.Write($buffer, 0, $bytesRead)
-        $bytes = $collected.ToArray()
-        $newlineIndex = [Array]::IndexOf($bytes, [byte]10)
-        if ($newlineIndex -ge 0) {
-          $crlf = $newlineIndex -gt 0 -and $bytes[$newlineIndex - 1] -eq [byte]13
-          $lineLength = if ($crlf) { $newlineIndex - 1 } else { $newlineIndex }
-          return @{
-            firstLine = [System.Text.Encoding]::UTF8.GetString($bytes, 0, $lineLength)
-            offset = $newlineIndex + 1
-          }
-        }
-      }
-
-      return @{
-        firstLine = [System.Text.Encoding]::UTF8.GetString($collected.ToArray())
-        offset = [int]$collected.Length
-      }
-    } finally {
-      $collected.Dispose()
-    }
-  }
-
-  function Invoke-RewriteOne($change, [int]$index) {
-    $path = [string]$change.path
-    $stamp = "$PID.$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()).$index"
-    $tmpPath = "$path.provider-sync.$stamp.tmp"
-    $backupPath = "$path.provider-sync.$stamp.bak"
-    $encoding = [System.Text.UTF8Encoding]::new($false)
-    $source = $null
-    $writer = $null
-
-    try {
-      try {
-        $source = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
-      } catch {
-        if (Test-Path $path) {
-          return "SKIP_BUSY"
-        }
-        return "SKIP_CHANGED"
-      }
-
-      if ([bool]$change.requireOriginalMatch) {
-        if ($source.Length -ne [int64]$change.originalSize) {
-          return "SKIP_CHANGED"
-        }
-
-        $record = Read-FirstLineRecord $source
-        if ($record.firstLine -ne [string]$change.originalFirstLine -or $record.offset -ne [int]$change.originalOffset) {
-          return "SKIP_CHANGED"
-        }
-
-        $separator = [string]$change.originalSeparator
-        $sourceOffset = [int64]$change.originalOffset
-        $headerOnly = $sourceOffset -ge [int64]$change.originalSize
-      } else {
-        $record = Read-FirstLineRecord $source
-        $separator = [string]$change.separator
-        $sourceOffset = [int64]$record.offset
-        $headerOnly = $record.offset -ge $source.Length
-      }
-
-      $writer = [System.IO.File]::Open($tmpPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-      $firstLineBytes = $encoding.GetBytes([string]$change.updatedFirstLine)
-      $writer.Write($firstLineBytes, 0, $firstLineBytes.Length)
-
-      if (-not [string]::IsNullOrEmpty($separator)) {
-        $separatorBytes = $encoding.GetBytes($separator)
-        $writer.Write($separatorBytes, 0, $separatorBytes.Length)
-      }
-
-      if (-not $headerOnly) {
-        $source.Seek($sourceOffset, [System.IO.SeekOrigin]::Begin) | Out-Null
-        $source.CopyTo($writer)
-      }
-
-      $writer.Flush()
-      $writer.Dispose()
-      $writer = $null
-
-      $source.Dispose()
-      $source = $null
-
-      try {
-        [System.IO.File]::Replace($tmpPath, $path, $backupPath, $true)
-      } catch {
-        if (-not (Test-Path $path)) {
-          return "SKIP_CHANGED"
-        }
-        throw
-      }
-
-      return "APPLIED"
-    } finally {
-      if ($writer) {
-        $writer.Dispose()
-      }
-      if ($source) {
-        $source.Dispose()
-      }
-      Remove-Item -Path $tmpPath -Force -ErrorAction SilentlyContinue
-      Remove-Item -Path $backupPath -Force -ErrorAction SilentlyContinue
-    }
-  }
-
-  $changes = Get-Content -Raw -Path $manifestPath | ConvertFrom-Json
-  $index = 0
-  foreach ($change in $changes) {
-    try {
-      $status = Invoke-RewriteOne $change $index
-    } catch {
-      $status = "ERROR:" + $_.Exception.Message
-    }
-    Write-Output ($status + "|" + [string]$change.path)
-    $index = $index + 1
-  }
-}
-`.trim();
-
-export function parseWindowsRewriteStatuses(stdout) {
-  const statusByPath = new Map();
-  for (const line of stdout.split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) {
-      continue;
-    }
-    const separatorIndex = trimmed.indexOf("|");
-    if (separatorIndex === -1) {
-      continue;
-    }
-    statusByPath.set(trimmed.slice(separatorIndex + 1), trimmed.slice(0, separatorIndex));
-  }
-  return statusByPath;
-}
-
-export function parseWindowsRewriteResults(stdout, changes) {
-  const statusByPath = parseWindowsRewriteStatuses(stdout);
-
-  const appliedPaths = [];
-  const skippedPaths = [];
-  const unexpected = [];
-  for (const change of changes) {
-    const status = statusByPath.get(change.path);
-    if (status === "APPLIED") {
-      appliedPaths.push(change.path);
-    } else if (status === "SKIP_BUSY" || status === "SKIP_CHANGED") {
-      skippedPaths.push(change.path);
-    } else {
-      unexpected.push(`${change.path}: ${status ?? "(no result)"}`);
-    }
-  }
-
-  appliedPaths.sort((left, right) => left.localeCompare(right));
-  skippedPaths.sort((left, right) => left.localeCompare(right));
-
-  if (unexpected.length > 0) {
-    // The PowerShell batch runs to completion before returning, so every
-    // APPLIED file is already on disk. Hand the caller the full applied set so
-    // it can roll them ALL back — not just the ones before the first error.
-    const error = new Error(`Unexpected rewrite result(s): ${unexpected.join("; ")}`);
-    error.appliedPaths = appliedPaths;
-    throw error;
-  }
-
-  return {
-    appliedChanges: appliedPaths.length,
-    appliedPaths,
-    skippedPaths
-  };
-}
-
-async function runWindowsRewriteBatch(batchChanges) {
-  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "codex-provider-rewrite-"));
-  const manifestPath = path.join(tempDir, "changes.json");
-  try {
-    await fsp.writeFile(manifestPath, JSON.stringify(batchChanges), "utf8");
-    try {
-      const { stdout } = await execFileAsync(
-        "powershell.exe",
-        [
-          "-NoProfile",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-Command",
-          WINDOWS_BATCH_REWRITE_SCRIPT,
-          manifestPath
-        ],
-        { maxBuffer: 64 * 1024 * 1024 }
-      );
-      return stdout;
-    } catch (error) {
-      throw wrapRolloutFileBusyError(error, batchChanges[0]?.path ?? "(unknown)", "rewrite");
-    }
-  } finally {
-    await fsp.rm(tempDir, { recursive: true, force: true });
-  }
-}
-
-async function applySessionChangesWindows(changes) {
-  const stdout = await runWindowsRewriteBatch(changes.map((change) => ({
-    path: change.path,
-    originalSize: change.originalSize,
-    originalFirstLine: change.originalFirstLine,
-    originalOffset: change.originalOffset,
-    originalSeparator: change.originalSeparator,
-    updatedFirstLine: change.updatedFirstLine,
-    requireOriginalMatch: true
-  })));
-  return parseWindowsRewriteResults(stdout, changes);
-}
-
+/**
+ * Rewrites the collected headers. A file that is in use or changed since it was
+ * collected is skipped, not overwritten. On a failure, the error carries the
+ * files already rewritten.
+ * @param {RolloutChange[]} changes
+ */
 export async function applySessionChanges(changes) {
-  if (!changes.length) {
-    return { appliedChanges: 0, appliedPaths: [], skippedPaths: [] };
-  }
-
-  if (process.platform === "win32") {
-    return applySessionChangesWindows(changes);
-  }
-
-  const skippedPaths = [];
+  /** @type {string[]} */
   const appliedPaths = [];
+  /** @type {string[]} */
+  const skippedPaths = [];
 
   for (const change of changes) {
-    let applied;
+    let status;
     try {
-      applied = await tryRewriteCollectedFirstLine(change);
+      status = await replaceFirstLine(change.path, change.updatedFirstLine, change.originalSeparator, change);
     } catch (error) {
-      // Preserve the files already rewritten so the caller can roll them back;
-      // otherwise a mid-batch failure would leave them silently changed.
-      error.appliedPaths = [...appliedPaths];
-      throw error;
+      throw new RolloutRewriteError(errorMessage(error), { appliedPaths: [...appliedPaths], cause: error });
     }
-    if (applied) {
-      appliedPaths.push(change.path);
-    } else {
-      skippedPaths.push(change.path);
-    }
+    (status === "applied" ? appliedPaths : skippedPaths).push(change.path);
   }
 
-  appliedPaths.sort((left, right) => left.localeCompare(right));
-  skippedPaths.sort((left, right) => left.localeCompare(right));
+  return { appliedPaths: sorted(appliedPaths), skippedPaths: sorted(skippedPaths) };
+}
+
+/**
+ * The writer lock of each change's thread that exists. Thread ids are UUIDs;
+ * anything else in a rollout header is not turned into a path.
+ * @param {string} codexHome
+ * @param {RolloutChange[]} changes
+ */
+async function writerLocksOf(codexHome, changes) {
+  const lockDir = codexPaths(codexHome).threadWriterLocks;
+  /** @type {Map<RolloutChange, string>} */
+  const locks = new Map();
+  for (const change of changes) {
+    if (change.threadId && /^[0-9a-f-]+$/i.test(change.threadId)) {
+      const lockPath = path.join(lockDir, `${change.threadId}.lock`);
+      if (await fileExists(lockPath)) {
+        locks.set(change, lockPath);
+      }
+    }
+  }
+  return locks;
+}
+
+// Rewrites replace the rollout file, so a running Codex that still has it open
+// would keep appending to the replaced file and lose those events. A thread is
+// in use when its rollout is open, or when Codex holds its writer lock open,
+// which also covers a writer that opens the rollout only to append.
+/**
+ * Splits off the changes whose thread another process is writing.
+ * @param {string} codexHome
+ * @param {RolloutChange[]} changes
+ */
+export async function splitLockedSessionChanges(codexHome, changes) {
+  const writerLocks = await writerLocksOf(codexHome, changes);
+  const openPaths = new Set(await findOpenFiles([...changes.map((change) => change.path), ...writerLocks.values()]));
+  /** @param {RolloutChange} change */
+  const inUse = (change) => openPaths.has(change.path) || openPaths.has(writerLocks.get(change) ?? "");
   return {
-    appliedChanges: appliedPaths.length,
-    appliedPaths,
-    skippedPaths
+    writableChanges: changes.filter((change) => !inUse(change)),
+    lockedChanges: changes.filter(inUse)
   };
 }
 
-export async function assertSessionFilesWritable(changes) {
-  if (!changes?.length) {
-    return;
-  }
-
-  const lockedPaths = await findOpenRolloutFiles(changes.map((change) => change.path));
-  if (lockedPaths.length === 0) {
-    return;
-  }
-
-  const preview = lockedPaths.slice(0, 5).join(", ");
-  const extraCount = lockedPaths.length - Math.min(lockedPaths.length, 5);
-  const suffix = extraCount > 0 ? ` (+${extraCount} more)` : "";
-  throw new Error(
-    `Unable to rewrite rollout files because ${lockedPaths.length} file(s) are currently in use. Close Codex and the Codex app, then retry. Locked file(s): ${preview}${suffix}`
-  );
-}
-
-export async function splitLockedSessionChanges(changes) {
-  if (!changes?.length) {
-    return {
-      writableChanges: changes ?? [],
-      lockedChanges: []
-    };
-  }
-
-  const lockedPaths = new Set(await findOpenRolloutFiles(changes.map((change) => change.path)));
-  if (lockedPaths.size === 0) {
-    return {
-      writableChanges: changes,
-      lockedChanges: []
-    };
-  }
-
-  const writableChanges = [];
-  const lockedChanges = [];
+/**
+ * Puts the original headers back after a failed sync.
+ * @param {RolloutChange[]} changes
+ */
+export async function restoreSessionChanges(changes) {
+  /** @type {{ path: string, message: string }[]} */
+  const failures = [];
   for (const change of changes) {
-    if (lockedPaths.has(change.path)) {
-      lockedChanges.push(change);
-    } else {
-      writableChanges.push(change);
-    }
-  }
-
-  return {
-    writableChanges,
-    lockedChanges
-  };
-}
-
-async function restoreSessionChangesPosix(manifestEntries) {
-  const failures = [];
-  for (const entry of manifestEntries) {
     try {
-      await rewriteFirstLine(entry.path, entry.originalFirstLine, entry.originalSeparator ?? "");
+      const status = await replaceFirstLine(change.path, change.originalFirstLine, change.originalSeparator);
+      if (status !== "applied") {
+        failures.push({ path: change.path, message: status === "busy" ? "in use" : "file is gone" });
+      }
     } catch (error) {
-      failures.push({ path: entry.path, message: error.message });
+      failures.push({ path: change.path, message: errorMessage(error) });
     }
   }
-  return failures;
-}
-
-export function collectWindowsRestoreFailures(stdout, manifestEntries) {
-  const statusByPath = parseWindowsRewriteStatuses(stdout);
-  const failures = [];
-  for (const entry of manifestEntries) {
-    const status = statusByPath.get(entry.path);
-    if (status !== "APPLIED") {
-      failures.push({ path: entry.path, message: `rewrite result: ${status ?? "(no result)"}` });
-    }
-  }
-  return failures;
-}
-
-async function restoreSessionChangesWindows(manifestEntries) {
-  const stdout = await runWindowsRewriteBatch(manifestEntries.map((entry) => ({
-    path: entry.path,
-    separator: entry.originalSeparator ?? "",
-    updatedFirstLine: entry.originalFirstLine,
-    requireOriginalMatch: false
-  })));
-  return collectWindowsRestoreFailures(stdout, manifestEntries);
-}
-
-export async function restoreSessionChanges(manifestEntries) {
-  if (!manifestEntries.length) {
-    return;
-  }
-
-  const failures = process.platform === "win32"
-    ? await restoreSessionChangesWindows(manifestEntries)
-    : await restoreSessionChangesPosix(manifestEntries);
-
   if (failures.length > 0) {
-    const details = failures
-      .map((failure) => `${failure.path}: ${failure.message}`)
-      .join("; ");
-    throw new Error(`Failed to restore ${failures.length} rollout file(s): ${details}`);
+    throw new Error(`Failed to restore ${failures.length} rollout file(s): ${formatFailures(failures)}`);
   }
 }
 
+/** @param {ProviderCounts} providerCounts */
 export function summarizeProviderCounts(providerCounts) {
+  /** @type {Record<string, Record<string, number>>} */
   const result = {};
   for (const [scope, counts] of Object.entries(providerCounts)) {
     result[scope] = Object.fromEntries([...counts.entries()].sort(([left], [right]) => left.localeCompare(right)));
