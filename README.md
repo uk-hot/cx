@@ -4,7 +4,9 @@ Manage multiple Codex accounts and keep their session **provider** metadata
 consistent. `cx` switches between registered Codex accounts and, on every switch,
 rewrites the `model_provider` field across your rollout files (`rollout-*.jsonl`)
 and the Codex SQLite state (`state_5.sqlite`) so the whole session history stays
-in sync with the active account's provider.
+in sync with the active account's provider. It also removes the per-account
+tags Codex 0.168+ puts on sessions, so after a switch every account sees the
+sessions that existed at that point.
 
 Codex home is fixed to `~/.codex`.
 
@@ -155,6 +157,16 @@ the saved `config.toml`, then synchronizes the `model_provider` metadata of all
 rollout files and SQLite rows to the switched account's provider. If the account
 can't be identified uniquely, you'll be prompted to choose (in a TTY).
 
+Codex 0.168+ records which ChatGPT account created a session
+(`account_scoped`, `creator_user_id` and `creator_account_id` in the rollout's
+`session_meta`, and the `creator_*` columns in SQLite) and its session picker
+then hides sessions created with another account. `cx switch` removes these tags,
+which makes the sessions shared like the ones created before Codex 0.168, so
+switching accounts keeps your session history visible. This also applies when
+both accounts use the same provider. Sessions created after the switch are
+tagged again until the next `cx switch`; a login changed with `codex login`
+instead of `cx` does not remove any tags.
+
 A ChatGPT login that isn't registered yet is registered before it is replaced.
 An API key that isn't saved can't be recovered once replaced, so `cx switch`
 stops and asks you to save it with `cx add <alias>` first.
@@ -210,13 +222,17 @@ On a `switch` (and its underlying sync), `cx`:
    settings before replacing them, preserving token refreshes made by Codex and
    settings changed since `cx add`.
 3. Scans `sessions/` and `archived_sessions/` for `rollout-*.jsonl` files and
-   collects those whose `session_meta` first line has a different provider.
+   collects those whose `session_meta` first line has a different provider or
+   carries a creator tag (`account_scoped`, `creator_user_id`,
+   `creator_account_id`), which is removed.
 4. Skips rollout files another process still has open (a running Codex session
    would otherwise keep appending to the replaced file and lose those events).
 5. Verifies the SQLite database is writable, then **rewrites the rollout files
    first** (outside any DB transaction) and **updates SQLite in a short
    transaction** — keeping the database lock brief regardless of file count.
-   Rows of skipped rollout files keep their provider.
+   The transaction also clears the `creator_user_id`/`creator_account_id`
+   columns; Codex fills empty columns from the rollout file, so both stores must
+   be cleared. Rows of skipped rollout files keep their provider and creator.
 6. If the SQLite update fails, the already-rewritten rollout files are rolled
    back, so the two stores do not diverge.
 
@@ -238,6 +254,14 @@ closing Codex to sync them.
 - Close Codex and the Codex app before switching if files are reported as locked.
 
 ## Changelog
+
+### 0.2.13
+
+- `cx switch` keeps sessions visible after an account switch with Codex 0.168+,
+  which shows only the sessions created with the current ChatGPT account. The
+  sync removes the creator tags from rollout files and SQLite, also when both
+  accounts use the same provider. The first switch after upgrading rewrites
+  every session created since Codex started tagging them.
 
 ### 0.2.12
 

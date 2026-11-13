@@ -5,6 +5,10 @@ export const DEFAULT_PROVIDER = "openai";
 export const DEFAULT_LOCK_NAME = "provider-sync.lock";
 export const DB_FILE_BASENAME = "state_5.sqlite";
 export const SESSION_DIRS = ["sessions", "archived_sessions"];
+// Codex 0.168+ tags threads with their creator: these columns in the threads
+// table, plus account_scoped in the rollout's session_meta only.
+export const CREATOR_COLUMNS = ["creator_user_id", "creator_account_id"];
+export const ACCOUNT_SCOPE_KEYS = ["account_scoped", ...CREATOR_COLUMNS];
 
 export function defaultCodexHome() {
   return path.join(os.homedir(), ".codex");

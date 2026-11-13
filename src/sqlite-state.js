@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import Database from "better-sqlite3";
 
-import { DB_FILE_BASENAME } from "./constants.js";
+import { CREATOR_COLUMNS, DB_FILE_BASENAME } from "./constants.js";
 
 const DEFAULT_BUSY_TIMEOUT_MS = 5000;
 
@@ -107,14 +107,21 @@ export async function updateSqliteProvider(codexHome, targetProvider, options = 
   let transactionOpen = false;
   try {
     setBusyTimeout(db, options.busyTimeoutMs);
+    // Clear the creator columns (Codex 0.168+) along with the rollout headers.
+    // Codex merges them back with COALESCE(row, rollout), so both must go.
+    // Read the schema before taking the write lock to keep the lock short.
+    const columns = new Set(db.prepare("PRAGMA table_info(threads)").all().map((column) => column.name));
+    const creatorColumns = CREATOR_COLUMNS.filter((column) => columns.has(column));
     db.exec("BEGIN IMMEDIATE");
     transactionOpen = true;
+    const assignments = ["model_provider = ?", ...creatorColumns.map((column) => `${column} = NULL`)];
+    const pending = ["COALESCE(model_provider, '') <> ?", ...creatorColumns.map((column) => `${column} IS NOT NULL`)];
     // Threads whose rollout file was skipped (locked or changed) keep their
-    // provider, so the rollout file and its row stay in agreement.
+    // provider and creator, so the rollout file and its row stay in agreement.
     const stmt = db.prepare(`
       UPDATE threads
-      SET model_provider = ?
-      WHERE COALESCE(model_provider, '') <> ?
+      SET ${assignments.join(", ")}
+      WHERE (${pending.join(" OR ")})
         AND id NOT IN (SELECT value FROM json_each(?))
         AND rollout_path NOT IN (SELECT value FROM json_each(?))
     `);

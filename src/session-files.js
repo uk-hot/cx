@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
-import { SESSION_DIRS } from "./constants.js";
+import { ACCOUNT_SCOPE_KEYS, SESSION_DIRS } from "./constants.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -106,6 +106,19 @@ function parseSessionMetaRecord(firstLine) {
     return parsed;
   } catch {
     return null;
+  }
+}
+
+// Codex 0.168+ tags new threads with their creator and lists only the current
+// login's account-scoped threads. Absent keys mean "shared with every account",
+// the state of threads created before the tagging.
+function hasAccountScope(payload) {
+  return ACCOUNT_SCOPE_KEYS.some((key) => Object.hasOwn(payload, key));
+}
+
+function clearAccountScope(payload) {
+  for (const key of ACCOUNT_SCOPE_KEYS) {
+    delete payload[key];
   }
 }
 
@@ -356,9 +369,10 @@ export async function collectSessionChanges(codexHome, targetProvider, options =
       const currentProvider = parsed.payload.model_provider ?? "(missing)";
       providerCounts[dirName].set(currentProvider, (providerCounts[dirName].get(currentProvider) ?? 0) + 1);
 
-      if (!statusOnly && parsed.payload.model_provider !== targetProvider) {
+      if (!statusOnly && (parsed.payload.model_provider !== targetProvider || hasAccountScope(parsed.payload))) {
         const snapshot = await getFileSnapshot(rolloutPath);
         parsed.payload.model_provider = targetProvider;
+        clearAccountScope(parsed.payload);
         summaries.push({
           path: rolloutPath,
           threadId: parsed.payload.id ?? null,
