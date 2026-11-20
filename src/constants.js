@@ -29,6 +29,14 @@ export function codexPaths(codexHome) {
     // Codex 0.168+ holds <thread id>.lock open (and flocked) while it writes a thread.
     threadWriterLocks: path.join(codexHome, "thread-writer-locks"),
     accounts,
-    registry: path.join(accounts, "registry.json")
+    registry: path.join(accounts, "registry.json"),
+    // Which registered account each thread belongs to (cx's own file).
+    threadOwners: path.join(accounts, "threads.json"),
+    // Codex's prompt history: one {session_id, ts, text} line per prompt.
+    history: path.join(codexHome, "history.jsonl"),
+    memoriesDb: path.join(codexHome, "memories_1.sqlite"),
+    // Per-thread leftovers `codex delete` leaves behind: <thread id>.<n>.sh, <thread id>.
+    shellSnapshots: path.join(codexHome, "shell_snapshots"),
+    threadReferenceCapabilities: path.join(codexHome, "tui-thread-reference-capabilities")
   };
 }

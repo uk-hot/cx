@@ -483,6 +483,32 @@ export async function splitLockedSessionChanges(codexHome, changes) {
 }
 
 /**
+ * The ids of the threads another process is using: its rollout file is open,
+ * or Codex holds its writer lock open.
+ * @param {string} codexHome
+ * @param {{ id: string, rolloutPath: string | null }[]} threads
+ * @returns {Promise<Set<string>>}
+ */
+export async function findThreadsInUse(codexHome, threads) {
+  const asChanges = threads.map((thread) => /** @type {RolloutChange} */ ({ path: thread.rolloutPath ?? "", threadId: thread.id }));
+  const writerLocks = await writerLocksOf(codexHome, asChanges);
+  const rolloutPaths = [];
+  for (const thread of threads) {
+    if (thread.rolloutPath && await fileExists(thread.rolloutPath)) {
+      rolloutPaths.push(thread.rolloutPath);
+    }
+  }
+  const openPaths = new Set(await findOpenFiles([...rolloutPaths, ...writerLocks.values()]));
+  const inUse = new Set();
+  asChanges.forEach((change, index) => {
+    if ((change.path && openPaths.has(change.path)) || openPaths.has(writerLocks.get(change) ?? "")) {
+      inUse.add(threads[index].id);
+    }
+  });
+  return inUse;
+}
+
+/**
  * Puts the original headers back after a failed sync.
  * @param {RolloutChange[]} changes
  */

@@ -81,6 +81,34 @@ export function parseAuthText(authText) {
 }
 
 /**
+ * The ids Codex 0.168+ tags a thread with when this login creates it
+ * (creator_user_id, creator_account_id). The user id is ChatGPT's "user-..."
+ * id from the tokens' auth claim, not the sign-in `sub` the registry keys on.
+ * @param {string | null} authText
+ * @returns {{ userId: string | null, accountId: string } | null}
+ */
+export function creatorIdsOf(authText) {
+  let tokens;
+  try {
+    tokens = JSON.parse(authText ?? "null")?.tokens;
+  } catch {
+    return null;
+  }
+  if (!tokens) {
+    return null;
+  }
+  for (const token of [tokens.id_token, tokens.access_token]) {
+    const claim = decodeJwtPayload(token)?.["https://api.openai.com/auth"];
+    const accountId = claim?.chatgpt_account_id ?? tokens.account_id;
+    const userId = claim?.chatgpt_user_id ?? claim?.user_id ?? null;
+    if (typeof accountId === "string" && accountId && typeof userId === "string") {
+      return { userId, accountId };
+    }
+  }
+  return typeof tokens.account_id === "string" && tokens.account_id ? { userId: null, accountId: tokens.account_id } : null;
+}
+
+/**
  * Identifies a non-OAuth login (which has no account key) without storing the
  * API key itself in the registry.
  * @param {string} authText

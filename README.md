@@ -29,6 +29,10 @@ cx add [alias]
 cx warm [start|stop|--watch]
 cx list
 cx remove <email|alias>
+cx sessions [<email|alias>|--unassigned]
+cx sessions assign <email|alias> <id>...
+cx sessions delete <email|alias> <id>... | --all
+cx sessions delete --unassigned
 ```
 
 ### `cx status`
@@ -268,7 +272,83 @@ failed, or went through but the window still shows as not started.
 Lists the accounts registered in the registry (email/alias and provider), marking the
 active one with `*`. It is offline — it does not contact any provider/usage API —
 and only writes the registry to record the account currently logged in to
-`auth.json`.
+`auth.json` (and, when that changed behind `cx`'s back, the session owners it
+can tell from creator tags).
+
+### `cx sessions`
+
+`cx switch` shares every session with every account, so Codex no longer knows
+whose a session is. `cx` keeps track of it instead, in
+`~/.codex/accounts/threads.json`: a session belongs to the account that used it
+last, i.e. the one logged in when its latest turn started. Resuming another
+account's session moves it to the account resuming it.
+
+```text
+$ cx sessions
++------------------+----------+-------------+
+| ACCOUNT          | SESSIONS | WITH MEMORY |
++------------------+----------+-------------+
+| one@example.com  | 12       | 3           |
+| two@example.com  | 4        | 0           |
+| (unassigned)     | 1250     | 41          |
++------------------+----------+-------------+
+```
+
+`cx sessions <email|alias>` lists that account's sessions (id, last update,
+how `cx` learned the owner, whether Codex extracted a memory from it, title);
+`cx sessions --unassigned` lists the ones no registered account owns.
+
+How the owner is known:
+
+- `activity`: whenever the account changes (`cx switch`, `cx add`), and on
+  each `cx sessions`, the sessions whose latest turn started since the account
+  became active are credited to it. This only counts while
+  `auth.json` holds that account's login; after a `codex login` behind `cx`'s
+  back, only creator tags are used until the next `cx switch`.
+- `tag`: Codex 0.168+ tags a new session with the ChatGPT account that created
+  it, until `cx switch` clears the tag. `cx` reads the tags before it clears
+  them, and a tag also wins over `activity` for a session created by another
+  login than the active one.
+- `manual`: `cx sessions assign <email|alias> <id>...` gives sessions to an
+  account by hand.
+
+Sessions from before `cx` tracked owners, sessions of a removed account, and
+those used under a login `cx` couldn't attribute are unassigned. Sessions with
+API-key and third-party accounts have no tags, so only `activity` and `manual`
+apply to them.
+
+`cx sessions delete` permanently deletes sessions with everything Codex keeps
+about them:
+
+```bash
+cx sessions delete work 01a1f743 01a1f7c9   # these sessions of "work" (an id or a unique prefix)
+cx sessions delete work --all               # every session of "work"
+cx sessions delete --unassigned             # every session no account owns
+cx sessions delete work --all --dry-run     # only show what would be deleted
+```
+
+Each session is deleted with `codex delete --force <id>`, which removes its
+rollout file, its rows in Codex's databases (including the paginated thread
+history), its session name, and the memory Codex extracted from it. `cx` then removes its prompts from `history.jsonl`, its
+shell snapshots and its other leftovers. A session the given account doesn't
+own is refused. `codex delete` also deletes the sub-agent sessions a session
+spawned, so they are listed with it, and a session with a sub-agent session of
+another owner is left alone (`cx` says which).
+
+- `cx` lists what it will delete and asks first; outside a terminal it needs
+  `--yes`. Nothing can be restored afterwards.
+- Sessions that Codex has open are skipped; close them and run it again. A
+  session another account used between the confirmation and the delete is
+  skipped too.
+- Codex appends to `history.jsonl` while it runs, so close Codex before a
+  delete if you can. If the prompts or leftover files of deleted sessions can't
+  be removed, the next `cx sessions` command finishes it.
+- Codex rebuilds its consolidated memory (`~/.codex/memories`) without the
+  deleted sessions the next time it runs with memories on; until then, what it
+  had already merged in from them stays there.
+- It needs a Codex with `codex delete --force` (0.171 has it).
+- It deletes local data only: OpenAI's records of the requests and Codex Cloud
+  tasks are not affected.
 
 ### `cx remove <email|alias>`
 
@@ -280,7 +360,7 @@ again. To add it back, sign in to it with `cx add`. A removed API key that is
 still in `auth.json` no longer counts as unsaved, so `cx switch` and `cx add`
 can replace it (the registry keeps only its SHA-256 digest); `cx add <alias>`
 adds it back. `cx remove` doesn't change the login, so it never restarts the
-Codex app-server daemon.
+Codex app-server daemon. The account's sessions stay and become unassigned.
 
 ## How it works
 
@@ -323,6 +403,11 @@ closed. Skipped files are reported rather than corrupted; re-run
   sends one short request to OpenAI and may refresh that account's tokens. The
   private Codex home it uses for that holds a copy of the account's login while
   it runs.
+- `cx sessions delete` runs `codex delete` and rewrites `history.jsonl`
+  without the deleted sessions' prompts. Every other `cx sessions` command and
+  each account change read the session database and rollouts, and write only
+  `~/.codex/accounts/threads.json` (and finish removing the prompts of
+  sessions an earlier delete couldn't).
 - `cx add` copies your `auth.json` (OAuth tokens or API keys) and `config.toml`
   into `~/.codex/accounts/`, readable by the owner only. Treat that directory as
   sensitive.
@@ -332,6 +417,12 @@ closed. Skipped files are reported rather than corrupted; re-run
 
 ### Unreleased
 
+- New `cx sessions`: `cx` now records which account each session belongs to
+  (the one that used it last; Codex's creator tags are read before
+  `cx switch` clears them), lists the sessions by account, and
+  `cx sessions delete` permanently deletes an account's sessions (some or all),
+  or the unassigned ones, with their memories and prompt history, through
+  `codex delete`.
 - New `cx warm`: starts every account's weekly quota window that hasn't
   started yet with a minimal `codex exec` request, so an unused account's next
   week starts at its reset rather than at its next use. While Codex is in use,

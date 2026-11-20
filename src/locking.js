@@ -165,3 +165,36 @@ export async function withLock(codexHome, label, fn) {
     await releaseLock();
   }
 }
+
+const LOCK_ATTEMPTS = 60;
+const LOCK_RETRY_MS = 1000;
+
+/**
+ * Runs `fn` under the cx lock, waiting up to a minute if another cx run holds
+ * it: saving refreshed tokens must not fail just because a switch is running.
+ * @template T
+ * @param {string} codexHome
+ * @param {string} label
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ */
+export async function withLockWhenFree(codexHome, label, fn) {
+  for (let attempt = 1; ; attempt += 1) {
+    /** @type {(() => Promise<void>) | null} */
+    let releaseLock = null;
+    try {
+      releaseLock = await acquireLock(codexHome, label);
+    } catch (error) {
+      if (/** @type {{ code?: string }} */ (error)?.code !== LOCK_BUSY_CODE || attempt >= LOCK_ATTEMPTS) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, LOCK_RETRY_MS));
+      continue;
+    }
+    try {
+      return await fn();
+    } finally {
+      await releaseLock();
+    }
+  }
+}

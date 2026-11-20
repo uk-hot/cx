@@ -121,6 +121,138 @@ export async function readSqliteProviderCounts(codexHome) {
 }
 
 /**
+ * @typedef {object} ThreadRow
+ * @property {string} id
+ * @property {string | null} rolloutPath
+ * @property {string} title the thread's name, title or preview, whichever is set
+ * @property {string | null} cwd
+ * @property {number | null} createdAtMs
+ * @property {number | null} updatedAtMs no earlier than the thread's last update
+ * @property {boolean} archived
+ * @property {string | null} creatorUserId Codex 0.168+ creator tag, until cx sync clears it
+ * @property {string | null} creatorAccountId
+ */
+
+/**
+ * Every thread in the state database, or null without one. Columns Codex
+ * added over time are read only when they exist.
+ * @param {string} codexHome
+ * @returns {Promise<ThreadRow[] | null>}
+ */
+export async function readThreadRows(codexHome) {
+  const db = await openStateDatabase(codexHome);
+  if (!db) {
+    return null;
+  }
+  try {
+    const columns = new Set(db.prepare("PRAGMA table_info(threads)").all().map((column) => String(column.name)));
+    /** @param {string} column @param {string} [fallback] */
+    const col = (column, fallback = "NULL") => (columns.has(column) ? column : fallback);
+    /** @param {string} column */
+    const text = (column) => (columns.has(column) ? `NULLIF(${column}, '')` : "NULL");
+    // A whole-second column is read as the last millisecond of its second for
+    // updated_at, which callers use as "not before", and as the first for
+    // created_at.
+    /** @param {string} msColumn @param {string} secondsColumn @param {number} [roundUp] */
+    const ms = (msColumn, secondsColumn, roundUp = 0) => `COALESCE(${col(msColumn)}, ${columns.has(secondsColumn) ? `${secondsColumn} * 1000 + ${roundUp}` : "NULL"})`;
+    const rows = db.prepare(`
+      SELECT
+        id,
+        ${col("rollout_path")} AS rollout_path,
+        COALESCE(${["name", "title", "preview", "first_user_message"].map(text).join(", ")}, '') AS title,
+        ${col("cwd")} AS cwd,
+        ${ms("created_at_ms", "created_at")} AS created_at_ms,
+        ${ms("updated_at_ms", "updated_at", 999)} AS updated_at_ms,
+        ${col("archived", "0")} AS archived,
+        ${col("creator_user_id")} AS creator_user_id,
+        ${col("creator_account_id")} AS creator_account_id
+      FROM threads
+    `).all();
+    return rows.map((row) => ({
+      id: String(row.id),
+      rolloutPath: row.rollout_path === null ? null : String(row.rollout_path),
+      title: String(row.title),
+      cwd: row.cwd === null ? null : String(row.cwd),
+      createdAtMs: row.created_at_ms === null ? null : Number(row.created_at_ms),
+      updatedAtMs: row.updated_at_ms === null ? null : Number(row.updated_at_ms),
+      archived: Boolean(row.archived),
+      creatorUserId: row.creator_user_id === null ? null : String(row.creator_user_id),
+      creatorAccountId: row.creator_account_id === null ? null : String(row.creator_account_id)
+    }));
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Which of `ids` the state database still has.
+ * @param {string} codexHome
+ * @param {string[]} ids
+ * @returns {Promise<Set<string>>}
+ */
+export async function readPresentThreadIds(codexHome, ids) {
+  const db = await openStateDatabase(codexHome);
+  if (!db || ids.length === 0) {
+    db?.close();
+    return new Set();
+  }
+  try {
+    return new Set(db.prepare("SELECT id FROM threads WHERE id IN (SELECT value FROM json_each(?))")
+      .all(JSON.stringify(ids))
+      .map((row) => String(row.id)));
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Parent → child links of the sub-agent threads a thread spawned.
+ * @param {string} codexHome
+ * @returns {Promise<{ parent: string, child: string }[]>}
+ */
+export async function readThreadSpawnEdges(codexHome) {
+  const db = await openStateDatabase(codexHome);
+  if (!db) {
+    return [];
+  }
+  try {
+    const table = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'thread_spawn_edges'").get();
+    if (!table) {
+      return [];
+    }
+    return db.prepare("SELECT parent_thread_id, child_thread_id FROM thread_spawn_edges").all()
+      .map((row) => ({ parent: String(row.parent_thread_id), child: String(row.child_thread_id) }));
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * The threads Codex extracted a memory from (memories_1.sqlite).
+ * @param {string} codexHome
+ * @returns {Promise<Set<string>>}
+ */
+export async function readMemoryThreadIds(codexHome) {
+  const dbPath = codexPaths(codexHome).memoriesDb;
+  try {
+    await fs.access(dbPath);
+  } catch {
+    return new Set();
+  }
+  const db = openDatabase(dbPath);
+  try {
+    db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    const table = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'stage1_outputs'").get();
+    if (!table) {
+      return new Set();
+    }
+    return new Set(db.prepare("SELECT thread_id FROM stage1_outputs").all().map((row) => String(row.thread_id)));
+  } finally {
+    db.close();
+  }
+}
+
+/**
  * The rollout files of the threads Codex updated last, newest first.
  * @param {string} codexHome
  * @param {number} limit

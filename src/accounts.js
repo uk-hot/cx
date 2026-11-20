@@ -16,6 +16,7 @@ import {
   snapshotPaths,
   writeRegistry
 } from "./registry.js";
+import { tryRecordSessionOwners } from "./session-owners.js";
 
 /** @typedef {import("./auth-file.js").AuthIdentity} AuthIdentity */
 /** @typedef {import("./registry.js").Account} Account */
@@ -69,10 +70,16 @@ export function lastRefreshMs(authText) {
 }
 
 /**
+ * Makes `accountKey` the active account, after crediting the threads used
+ * since the previous activation to the outgoing account (see
+ * session-owners.js). Callers hold the cx lock and write the registry after.
+ * @param {string} codexHome
  * @param {Registry} registry
  * @param {string} accountKey
+ * @param {AuthIdentity | null} liveLogin the login auth.json holds before the change
  */
-function markActive(registry, accountKey) {
+async function markActive(codexHome, registry, accountKey, liveLogin) {
+  await tryRecordSessionOwners(codexHome, registry, { liveLogin });
   registry.active_account_key = accountKey;
   registry.active_account_activated_at_ms = Date.now();
 }
@@ -171,7 +178,9 @@ export async function syncActiveAccountFromCurrentAuth(codexHome) {
 
     let changed = false;
     if (registry.active_account_key !== parsed.accountKey) {
-      markActive(registry, parsed.accountKey);
+      // Codex was signed in to another account behind cx's back, at a time cx
+      // doesn't know: only creator tags can say whose the recent threads are.
+      await markActive(codexHome, registry, parsed.accountKey, parsed);
       changed = true;
     }
     /** @type {Partial<Account>} */
@@ -283,7 +292,7 @@ async function registerAccount(codexHome, { parsed, alias, provider, authText, c
     registry.accounts.push(accountEntry);
   }
 
-  markActive(registry, accountKey);
+  await markActive(codexHome, registry, accountKey, parsed);
   await writeRegistry(codexHome, registry);
 
   return { accountKey, email: accountEntry.email, alias: accountEntry.alias, provider };
@@ -365,6 +374,14 @@ export async function addAccountWithLogin(codexHome, alias, { runCodex, onCurren
   const saveCurrent = previous !== null && previous.accountKey !== removedAccountKey;
   onCurrentSaved?.(saveCurrent ? await addAccount(codexHome) : null);
 
+  // The sign-in replaces the login, after which nothing tells whose the
+  // threads used until now are. Saving the current account above credited
+  // them already, but an API key or a removed account isn't saved there.
+  await withLock(codexHome, "add", async () => {
+    const outgoingLogin = liveLoginOf(previousAuthText, await readTextIfExists(codexPaths(codexHome).config));
+    await tryRecordSessionOwners(codexHome, await readRegistry(codexHome), { liveLogin: outgoingLogin });
+  });
+
   await fs.rm(authPath, { force: true });
 
   // Codex stays open after signing in, so its exit code says nothing about the
@@ -430,6 +447,8 @@ export async function useAccount(codexHome, identifier) {
   await registerLiveLogin(codexHome);
   const registry = await readRegistry(codexHome);
   const match = findSingleAccount(registry.accounts, identifier);
+  const paths = codexPaths(codexHome);
+  const outgoingLogin = liveLoginOf(await readTextIfExists(paths.auth), await readTextIfExists(paths.config));
 
   const snapshot = snapshotPaths(codexHome, match.account_key);
   const hasAuthSnapshot = await fileExists(snapshot.auth);
@@ -446,7 +465,6 @@ export async function useAccount(codexHome, identifier) {
   await persistCurrentOAuthSnapshot(codexHome, registry);
   await persistCurrentConfigSnapshot(codexHome, registry);
 
-  const paths = codexPaths(codexHome);
   if (hasAuthSnapshot) {
     await writeFileAtomically(paths.auth, await fs.readFile(snapshot.auth, "utf8"));
   } else {
@@ -467,7 +485,7 @@ export async function useAccount(codexHome, identifier) {
 
   match.provider = (await readProviderFromConfig(codexHome)) ?? match.provider;
   match.last_used_at = nowSeconds();
-  markActive(registry, match.account_key);
+  await markActive(codexHome, registry, match.account_key, outgoingLogin);
   // auth.json no longer holds the removed account's login.
   delete registry.removed_account_key;
   delete registry.removed_auth_sha256;

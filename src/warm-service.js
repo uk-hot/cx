@@ -7,7 +7,8 @@ import { lastRefreshMs, liveLoginOf } from "./accounts.js";
 import { parseAuthText } from "./auth-file.js";
 import { codexPaths } from "./constants.js";
 import { errorMessage, fileModeOr, isNotFound, readTextIfExists, writeFileAtomically } from "./fs-utils.js";
-import { LOCK_BUSY_CODE, isProcessRunning, startedSinceBoot, withLock } from "./locking.js";
+import { isProcessRunning, startedSinceBoot, withLockWhenFree } from "./locking.js";
+import { DETACHED, killTree } from "./process-tree.js";
 import { readRegistry, snapshotPaths } from "./registry.js";
 import { NO_SAVED_LOGIN, SIGN_IN_EXPIRED, SIGNED_OUT, formatDuration, getAccountUsage } from "./usage-service.js";
 
@@ -45,8 +46,6 @@ const WARM_DIR_PREFIX = "cx-warm-";
 const WARM_OWNER_FILE = "cx-owner.json";
 // A warm-up home without an owner file is being created, unless it is this old.
 const OWNERLESS_WARM_DIR_STALE_MS = 60 * 1000;
-const LOCK_ATTEMPTS = 60;
-const LOCK_RETRY_MS = 1000;
 // Usage the request caused can take a moment to show up.
 const VERIFY_DELAY_MS = 3000;
 const RESET_GRACE_MS = 60 * 1000;
@@ -110,30 +109,12 @@ export function interpretExecOutput(code, stdout, stderr) {
   return { ok: false, detail: failure ?? lastStderrLine ?? `codex exited with code ${code}` };
 }
 
-// Every process the Codex command starts must end with it: one that outlives cx
-// may still refresh tokens in a warm-up home after cx saved and removed it. On
-// POSIX Codex runs in a process group of its own, which is killed as a whole
-// (the npm launcher may run the native binary as a child of its own); on
-// Windows it runs under cmd.exe, and the whole tree is ended.
+// Every process the Codex command starts must end with it (see
+// process-tree.js): one that outlives cx may still refresh tokens in a warm-up
+// home after cx saved and removed it.
 
 /** @type {Set<import("node:child_process").ChildProcess>} */
 const activeExecs = new Set();
-
-/** @param {import("node:child_process").ChildProcess} child */
-function killTree(child) {
-  if (!child.pid) {
-    return;
-  }
-  if (process.platform === "win32") {
-    spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => {});
-    return;
-  }
-  try {
-    process.kill(-child.pid, "SIGKILL");
-  } catch {
-    // The group is gone.
-  }
-}
 
 /**
  * Whether the Codex started as `pid` still runs, with anything it started.
@@ -176,7 +157,7 @@ export function runCodexExec({ codexHome, cwd, timeoutMs = EXEC_TIMEOUT_MS, onSp
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, CODEX_HOME: codexHome },
-      detached: process.platform !== "win32",
+      detached: DETACHED,
       // npm installs codex as a .cmd shim on Windows, which needs a shell.
       shell: process.platform === "win32"
     });
@@ -245,27 +226,6 @@ function ownerFileOf(warmDir) {
 }
 
 /**
- * Runs `fn` under the cx lock, waiting for a while if another cx run holds it:
- * saving refreshed tokens must not fail just because a switch is running.
- * @template T
- * @param {string} codexHome
- * @param {() => Promise<T>} fn
- * @returns {Promise<T>}
- */
-async function withLockWhenFree(codexHome, fn) {
-  for (let attempt = 1; ; attempt += 1) {
-    try {
-      return await withLock(codexHome, "warm", fn);
-    } catch (error) {
-      if (/** @type {{ code?: string }} */ (error)?.code !== LOCK_BUSY_CODE || attempt >= LOCK_ATTEMPTS) {
-        throw error;
-      }
-      await delay(LOCK_RETRY_MS);
-    }
-  }
-}
-
-/**
  * Codex refreshes the tokens of the home it runs in. A refresh token is
  * single-use, so tokens refreshed in a warm-up home must replace the account's
  * snapshot, and auth.json too while Codex is logged in to that account, or the
@@ -312,7 +272,7 @@ async function recoverWarmDir(codexHome, accountKey, warmDir) {
   // Checked again under the lock: another cx may have recovered and claimed it
   // meanwhile. While the abandoned home exists nobody can claim it, so nothing
   // can take its place before it is removed.
-  return withLockWhenFree(codexHome, async () => {
+  return withLockWhenFree(codexHome, "warm", async () => {
     const state = await warmDirState(warmDir);
     if (state !== "abandoned") {
       return state === "gone";
@@ -433,7 +393,7 @@ function watchRefreshedTokens(codexHome, accountKey, warmDir, initialText) {
         // A half-written file is passed over, and saved once it is complete.
         seen = text;
         // They are saved again once Codex is done, so a failure only costs time.
-        await withLockWhenFree(codexHome, () => saveRefreshedTokens(codexHome, accountKey, warmDir)).catch(() => {});
+        await withLockWhenFree(codexHome, "warm", () => saveRefreshedTokens(codexHome, accountKey, warmDir)).catch(() => {});
       }
     }
   })();
@@ -500,7 +460,7 @@ export async function warmAccount(codexHome, accountKey, { runExec = runCodexExe
       // home stays for a later run to recover once it ended.
       keepWarmDir = execRunning(execPid);
       try {
-        await withLockWhenFree(codexHome, () => saveRefreshedTokens(codexHome, accountKey, warmDir));
+        await withLockWhenFree(codexHome, "warm", () => saveRefreshedTokens(codexHome, accountKey, warmDir));
       } catch (error) {
         // The next run recovers them from the warm-up home.
         keepWarmDir = true;
