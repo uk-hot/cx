@@ -15,12 +15,14 @@ function sessionMeta(id, provider) {
   return JSON.stringify({ type: "session_meta", payload: { id, model_provider: provider } });
 }
 
-async function makeCodexHome(t, threads) {
+// The default target provider is longer than "openai", so the headers grow and
+// the rollouts are replaced, not rewritten in place.
+async function makeCodexHome(t, threads, { provider = "gateway" } = {}) {
   const codexHome = await fsp.mkdtemp(path.join(os.tmpdir(), "cx-sync-"));
   t.after(() => fsp.rm(codexHome, { recursive: true, force: true }));
   const dir = path.join(codexHome, "sessions", "2026", "10", "31");
   await fsp.mkdir(dir, { recursive: true });
-  await fsp.writeFile(path.join(codexHome, "config.toml"), "model_provider = \"any\"\n", "utf8");
+  await fsp.writeFile(path.join(codexHome, "config.toml"), `model_provider = "${provider}"\n`, "utf8");
 
   const db = new Database(path.join(codexHome, "state_5.sqlite"));
   db.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, model_provider TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0)");
@@ -59,10 +61,10 @@ test("sync rewrites rollouts, keeps their mode and updates SQLite", async (t) =>
   const { codexHome, files } = await makeCodexHome(t, ["a", "b"]);
 
   const result = await runSync({ codexHome });
-  assert.equal(result.targetProvider, "any");
+  assert.equal(result.targetProvider, "gateway");
   assert.equal(result.changedSessionFiles, 2);
   assert.equal(result.sqliteRowsUpdated, 2);
-  assert.deepEqual(readProviders(codexHome), { a: "any", b: "any" });
+  assert.deepEqual(readProviders(codexHome), { a: "gateway", b: "gateway" });
   for (const filePath of Object.values(files)) {
     // Windows has no POSIX permission bits to keep.
     if (process.platform !== "win32") {
@@ -80,7 +82,7 @@ test("sync skips rollouts another process has open and leaves their rows alone",
   const result = await runSync({ codexHome });
   assert.deepEqual(result.skippedLockedRolloutFiles, [files.busy]);
   assert.equal(result.changedSessionFiles, 1);
-  assert.deepEqual(readProviders(codexHome), { busy: "openai", idle: "any" });
+  assert.deepEqual(readProviders(codexHome), { busy: "openai", idle: "gateway" });
   // The open file was not replaced, so the holder's later writes still land in it.
   assert.equal((await fsp.stat(files.busy)).ino, inodeBefore);
   assert.match(await fsp.readFile(files.busy, "utf8"), /"model_provider":"openai"/);
@@ -136,12 +138,13 @@ test("sync shares account-scoped threads with every account, including on the sa
 });
 
 test("sync leaves the creator of a skipped rollout in place", { skip: !["linux", "win32"].includes(process.platform) }, async (t) => {
-  const { codexHome, files } = await makeCodexHome(t, ["busy"]);
+  // Longer than the tags it removes, so the header grows and the open file is skipped.
+  const { codexHome, files } = await makeCodexHome(t, ["busy"], { provider: `gateway-${"x".repeat(80)}` });
   const header = JSON.stringify({ type: "session_meta", payload: { account_scoped: true, creator_account_id: "acct-a", id: "busy", model_provider: "openai" } });
   await fsp.writeFile(files.busy, `${header}\n{"n":1}\n`, { mode: 0o600 });
   const db = new Database(path.join(codexHome, "state_5.sqlite"));
   db.exec("ALTER TABLE threads ADD COLUMN creator_user_id TEXT; ALTER TABLE threads ADD COLUMN creator_account_id TEXT");
-  db.prepare("UPDATE threads SET creator_account_id = 'acct-a', model_provider = 'any'").run();
+  db.prepare("UPDATE threads SET creator_account_id = 'acct-a'").run();
   db.close();
   await holdOpen(t, files.busy);
 
@@ -172,5 +175,155 @@ test("sync skips a rollout whose thread writer lock Codex holds open", { skip: !
   const result = await runSync({ codexHome });
   assert.deepEqual(result.skippedLockedRolloutFiles, [files[thread]]);
   assert.equal(result.changedSessionFiles, 1);
-  assert.deepEqual(readProviders(codexHome), { [thread]: "openai", [idle]: "any" });
+  assert.deepEqual(readProviders(codexHome), { [thread]: "openai", [idle]: "gateway" });
+});
+
+// Codex 0.171+ records byte offsets into rollouts (paginated history, forks),
+// so a header that fits is overwritten in place with the same byte length.
+async function makeScopedHome(t, headers, provider) {
+  const codexHome = await fsp.mkdtemp(path.join(os.tmpdir(), "cx-sync-inplace-"));
+  t.after(() => fsp.rm(codexHome, { recursive: true, force: true }));
+  const dir = path.join(codexHome, "sessions", "2026", "11", "20");
+  await fsp.mkdir(dir, { recursive: true });
+  await fsp.writeFile(path.join(codexHome, "config.toml"), `model_provider = "${provider}"\n`, "utf8");
+  const db = new Database(path.join(codexHome, "state_5.sqlite"));
+  db.exec("CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, model_provider TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0, creator_user_id TEXT, creator_account_id TEXT)");
+  const insert = db.prepare("INSERT INTO threads (id, rollout_path, model_provider, creator_user_id, creator_account_id) VALUES (?, ?, ?, ?, ?)");
+  const files = {};
+  for (const payload of headers) {
+    files[payload.id] = path.join(dir, `rollout-${payload.id}.jsonl`);
+    await fsp.writeFile(files[payload.id], `${JSON.stringify({ type: "session_meta", payload })}\n{"n":1}\n{"n":2}\n`, { mode: 0o600 });
+    insert.run(payload.id, files[payload.id], payload.model_provider, payload.creator_user_id ?? null, payload.creator_account_id ?? null);
+  }
+  db.close();
+  return { codexHome, files };
+}
+
+function readRow(codexHome, id) {
+  const db = new Database(path.join(codexHome, "state_5.sqlite"), { readOnly: true });
+  try {
+    return { ...db.prepare("SELECT model_provider, creator_user_id, creator_account_id FROM threads WHERE id = ?").get(id) };
+  } finally {
+    db.close();
+  }
+}
+
+const scopedHeader = (id, extra = {}) => ({
+  account_scoped: true,
+  creator_user_id: "user-7nHuV3yM5ZgFadsZnzOb0RWh",
+  creator_account_id: "baf22b9e-1942-46e0-85fc-418ec19a4dfb",
+  id,
+  model_provider: "openai",
+  cwd: "/w",
+  history_mode: "paginated",
+  ...extra
+});
+
+test("sync rewrites a header that fits in place, keeping the file's size and byte offsets", async (t) => {
+  const { codexHome, files } = await makeScopedHome(t, [scopedHeader("paged")], "openai");
+  const before = await fsp.readFile(files.paged);
+  const { ino } = await fsp.stat(files.paged);
+
+  const result = await runSync({ codexHome });
+  assert.equal(result.changedSessionFiles, 1);
+  assert.deepEqual(result.oversizedRolloutFiles, []);
+  const after = await fsp.readFile(files.paged);
+  assert.equal(after.length, before.length);
+  assert.equal(after.indexOf(0x0a), before.indexOf(0x0a));
+  assert.equal(after.subarray(before.indexOf(0x0a)).toString(), before.subarray(before.indexOf(0x0a)).toString());
+  assert.equal((await fsp.stat(files.paged)).ino, ino);
+  const firstLine = after.toString("utf8").split("\n")[0];
+  assert.match(firstLine, / +$/);
+  assert.deepEqual(JSON.parse(firstLine).payload, { id: "paged", model_provider: "openai", cwd: "/w", history_mode: "paginated" });
+  assert.deepEqual(readRow(codexHome, "paged"), { model_provider: "openai", creator_user_id: null, creator_account_id: null });
+
+  // The padded header needs nothing more, and its room lets a later switch stay in place.
+  assert.equal((await runSync({ codexHome })).changedSessionFiles, 0);
+  await fsp.writeFile(path.join(codexHome, "config.toml"), "model_provider = \"gateway\"\n", "utf8");
+  assert.equal((await runSync({ codexHome })).changedSessionFiles, 1);
+  assert.equal((await fsp.readFile(files.paged)).length, before.length);
+  assert.equal(JSON.parse((await fsp.readFile(files.paged, "utf8")).split("\n")[0]).payload.model_provider, "gateway");
+});
+
+test("sync rewrites an open rollout in place without losing what its writer appends", { skip: process.platform === "win32" ? "an open file can't be opened exclusively" : false }, async (t) => {
+  const live = "01a1f90a-1624-7543-a87a-4087365fe66b";
+  const { codexHome, files } = await makeScopedHome(t, [scopedHeader(live)], "openai");
+  const lockDir = path.join(codexHome, "thread-writer-locks");
+  await fsp.mkdir(lockDir);
+  const lockPath = path.join(lockDir, `${live}.lock`);
+  await fsp.writeFile(lockPath, "");
+  await holdOpen(t, lockPath);
+  const writer = fs.openSync(files[live], "a");
+  t.after(() => fs.closeSync(writer));
+  await holdOpen(t, files[live]);
+
+  const result = await runSync({ codexHome });
+  assert.deepEqual(result.skippedLockedRolloutFiles, []);
+  assert.deepEqual(result.liveRolloutFiles, [files[live]]);
+  assert.equal(result.changedSessionFiles, 1);
+  assert.equal(readRow(codexHome, live).creator_account_id, null);
+
+  fs.writeSync(writer, "{\"n\":3}\n");
+  const lines = (await fsp.readFile(files[live], "utf8")).split("\n");
+  assert.equal(JSON.parse(lines[0]).payload.account_scoped, undefined);
+  assert.deepEqual(lines.slice(1), ["{\"n\":1}", "{\"n\":2}", "{\"n\":3}", ""]);
+});
+
+test("sync leaves a header with invalid UTF-8 alone instead of writing past it", async (t) => {
+  const { codexHome, files } = await makeScopedHome(t, [scopedHeader("bad", { cwd: "/w/X" })], "openai");
+  // A lone 0xff byte in place of "X" decodes to U+FFFD, two bytes longer.
+  const bytes = await fsp.readFile(files.bad);
+  bytes[bytes.indexOf(Buffer.from("/w/X")) + 3] = 0xff;
+  await fsp.writeFile(files.bad, bytes);
+
+  const result = await runSync({ codexHome });
+  assert.equal(result.changedSessionFiles, 0);
+  assert.deepEqual(await fsp.readFile(files.bad), bytes);
+});
+
+test("sync treats a thread paginated only in SQLite as addressed by byte offset", async (t) => {
+  const { codexHome, files } = await makeScopedHome(t, [
+    { id: "promoted", model_provider: "openai" },
+    { id: "projected", model_provider: "openai" },
+    { id: "legacy", model_provider: "openai" }
+  ], "gateway");
+  const state = new Database(path.join(codexHome, "state_5.sqlite"));
+  state.exec("ALTER TABLE threads ADD COLUMN history_mode TEXT NOT NULL DEFAULT 'legacy'; UPDATE threads SET history_mode = 'paginated' WHERE id = 'promoted'");
+  // Codex may store the path differently (a symlinked home): the id still matches.
+  state.exec("UPDATE threads SET rollout_path = '/elsewhere/rollout-promoted.jsonl' WHERE id = 'promoted'");
+  state.close();
+  const history = new Database(path.join(codexHome, "thread_history_1.sqlite"));
+  history.exec("CREATE TABLE thread_history_projection_state (thread_id TEXT PRIMARY KEY, next_rollout_byte_offset INTEGER NOT NULL, next_rollout_ordinal INTEGER NOT NULL); INSERT INTO thread_history_projection_state VALUES ('projected', 0, 0)");
+  history.close();
+  const before = await fsp.readFile(files.promoted, "utf8");
+
+  const result = await runSync({ codexHome });
+  assert.deepEqual(result.oversizedRolloutFiles, [files.projected, files.promoted].sort());
+  assert.equal(result.changedSessionFiles, 1);
+  assert.equal(await fsp.readFile(files.promoted, "utf8"), before);
+  assert.equal(readRow(codexHome, "promoted").model_provider, "openai");
+  assert.equal(readRow(codexHome, "projected").model_provider, "openai");
+  assert.equal(readRow(codexHome, "legacy").model_provider, "gateway");
+});
+
+test("sync leaves a rollout Codex addresses by byte offset when its header would grow", async (t) => {
+  const { codexHome, files } = await makeScopedHome(t, [
+    { id: "paged", model_provider: "openai", history_mode: "paginated" },
+    { id: "parent", model_provider: "openai" },
+    { id: "fork", model_provider: "openai", history_base: { thread_id: "parent", end_byte_offset: 10 }, account_scoped: true, creator_account_id: "baf22b9e-1942-46e0-85fc-418ec19a4dfb" },
+    { id: "legacy", model_provider: "openai" }
+  ], "gateway");
+  const before = Object.fromEntries(await Promise.all(Object.entries(files).map(async ([id, file]) => [id, await fsp.readFile(file, "utf8")])));
+
+  const result = await runSync({ codexHome });
+  assert.deepEqual(result.oversizedRolloutFiles, [files.paged, files.parent].sort());
+  // The fork's header fits once its tags are gone; a legacy rollout may still grow.
+  assert.equal(result.changedSessionFiles, 2);
+  assert.equal(await fsp.readFile(files.paged, "utf8"), before.paged);
+  assert.equal(await fsp.readFile(files.parent, "utf8"), before.parent);
+  assert.equal((await fsp.readFile(files.fork, "utf8")).length, before.fork.length);
+  assert.match(await fsp.readFile(files.legacy, "utf8"), /"model_provider":"gateway"/);
+  assert.equal(readRow(codexHome, "paged").model_provider, "openai");
+  assert.equal(readRow(codexHome, "parent").model_provider, "openai");
+  assert.deepEqual(readRow(codexHome, "fork"), { model_provider: "gateway", creator_user_id: null, creator_account_id: null });
 });

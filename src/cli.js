@@ -146,6 +146,12 @@ function summarizeSync(result, label) {
     lines.push(`Skipped locked rollout files: ${skipped.length}`);
     lines.push(`Locked file(s): ${skipped.slice(0, 5).join(", ")}${extraCount > 0 ? ` (+${extraCount} more)` : ""}`);
   }
+  const oversized = result.oversizedRolloutFiles;
+  if (oversized.length) {
+    const extraCount = oversized.length - Math.min(oversized.length, 5);
+    lines.push(`Left on their provider: ${oversized.length} rollout file(s) whose longer header would break Codex's paginated history`);
+    lines.push(`File(s): ${oversized.slice(0, 5).join(", ")}${extraCount > 0 ? ` (+${extraCount} more)` : ""}`);
+  }
   return lines.join("\n");
 }
 
@@ -172,15 +178,20 @@ async function restartDaemonForNewLogin() {
   return result.status === "restarted";
 }
 
-// The daemon keeps the rollout files of open sessions open, so the switch had to
-// skip them. Its restart closed them: sync them now instead of on the next switch.
+// Sync again once the daemon restarted. Its sessions kept the previous
+// account's creator tags in memory and wrote them back to SQLite while it shut
+// down (Codex keeps a creator that is already set), and the switch had to skip
+// the rollouts it held open that couldn't be rewritten in place (all of them on
+// Windows). Quiet when there was nothing left to do.
 /** @param {SyncResult} switchResult */
-async function resyncSkippedRollouts(switchResult) {
+async function resyncAfterDaemonRestart(switchResult) {
   try {
     const result = await runSync({ codexHome, provider: switchResult.targetProvider });
-    console.log(summarizeSync(result, "Re-synchronized"));
+    if (result.changedSessionFiles || result.sqliteRowsUpdated || result.skippedLockedRolloutFiles.length) {
+      console.log(summarizeSync(result, "Re-synchronized"));
+    }
   } catch (error) {
-    console.warn(`Could not sync the rollout files skipped by the switch (${errorMessage(error)}). Run cx switch again to sync them.`);
+    console.warn(`Could not sync the sessions again after the daemon restart (${errorMessage(error)}). Run cx switch again to finish.`);
   }
 }
 
@@ -287,8 +298,12 @@ async function switchAccount(identifier) {
   const account = result.switchedAccount;
   console.log(`Switched account: ${account.email || account.alias || resolved}${account.provider ? ` [${account.provider}]` : ""}`);
   console.log(summarizeSync(result, "Synchronized"));
-  if (await restartDaemonForNewLogin() && result.skippedLockedRolloutFiles.length) {
-    await resyncSkippedRollouts(result);
+  if (await restartDaemonForNewLogin()) {
+    await resyncAfterDaemonRestart(result);
+  } else if (result.liveRolloutFiles.length) {
+    // No restart closed them: a Codex outside the daemon (or a daemon that
+    // didn't restart) may tag them again with the previous account.
+    console.log(`Updated ${result.liveRolloutFiles.length} session(s) Codex has open. If one is hidden from this account after Codex closes it, run cx switch ${account.alias || account.email || resolved} again.`);
   }
 }
 

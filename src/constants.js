@@ -24,6 +24,7 @@ export function codexPaths(codexHome) {
     auth: path.join(codexHome, "auth.json"),
     config: path.join(codexHome, "config.toml"),
     stateDb: path.join(codexHome, "state_5.sqlite"),
+    threadHistoryDb: path.join(codexHome, "thread_history_1.sqlite"),
     tmp: path.join(codexHome, "tmp"),
     lockDir: path.join(codexHome, "tmp", "provider-sync.lock"),
     // Codex 0.168+ holds <thread id>.lock open (and flocked) while it writes a thread.

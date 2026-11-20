@@ -121,6 +121,45 @@ export async function readSqliteProviderCounts(codexHome) {
 }
 
 /**
+ * @param {string} dbPath
+ * @param {string} table
+ * @param {(db: import("node:sqlite").DatabaseSync, columns: Set<string>) => string[]} read
+ */
+async function readIdsFrom(dbPath, table, read) {
+  try {
+    await fs.access(dbPath);
+  } catch {
+    return [];
+  }
+  const db = openDatabase(dbPath);
+  try {
+    db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    const columns = new Set(db.prepare(`PRAGMA table_info(${table})`).all().map((column) => String(column.name)));
+    return columns.size ? read(db, columns) : [];
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * The threads Codex 0.171+ addresses by byte offset into their rollout: those
+ * with paginated history. Codex promotes older threads to it one way and may
+ * record that only in SQLite, so the rollout header alone doesn't tell.
+ * @param {string} codexHome
+ * @returns {Promise<Set<string>>}
+ */
+export async function readOffsetAddressedThreadIds(codexHome) {
+  const paths = codexPaths(codexHome);
+  const paginated = await readIdsFrom(paths.stateDb, "threads", (db, columns) => (columns.has("history_mode")
+    ? db.prepare("SELECT id FROM threads WHERE history_mode = 'paginated'").all().map((row) => String(row.id))
+    : []));
+  const projected = await readIdsFrom(paths.threadHistoryDb, "thread_history_projection_state", (db) => (
+    db.prepare("SELECT thread_id FROM thread_history_projection_state").all().map((row) => String(row.thread_id))
+  ));
+  return new Set([...paginated, ...projected]);
+}
+
+/**
  * @typedef {object} ThreadRow
  * @property {string} id
  * @property {string | null} rolloutPath

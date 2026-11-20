@@ -13,7 +13,7 @@ import {
   splitLockedSessionChanges,
   summarizeProviderCounts
 } from "./session-files.js";
-import { assertSqliteWritable, readSqliteProviderCounts, updateSqliteProvider } from "./sqlite-state.js";
+import { assertSqliteWritable, readOffsetAddressedThreadIds, readSqliteProviderCounts, updateSqliteProvider } from "./sqlite-state.js";
 import { ANSI, buildTable, colorEnabled, colorize } from "./terminal-ui.js";
 
 /** @typedef {import("./session-files.js").RolloutChange} RolloutChange */
@@ -25,6 +25,11 @@ import { ANSI, buildTable, colorEnabled, colorize } from "./terminal-ui.js";
  * @property {string} targetProvider
  * @property {number} changedSessionFiles
  * @property {string[]} skippedLockedRolloutFiles rollouts left for a later sync because they were in use
+ * @property {string[]} oversizedRolloutFiles rollouts left on their provider: the
+ *   new header is longer, and Codex addresses them by byte offset
+ * @property {string[]} liveRolloutFiles rollouts rewritten in place while Codex
+ *   had them open; it may write their creator tags back to SQLite until it
+ *   closes them
  * @property {number} sqliteRowsUpdated
  * @property {boolean} sqlitePresent
  */
@@ -127,8 +132,9 @@ async function restoreAndThrow(appliedChanges, causeError) {
 async function runSyncLocked({ codexHome, provider }) {
   const targetProvider = provider ?? (await readCurrentProvider(codexHome)).provider ?? DEFAULT_PROVIDER;
 
-  const { changes, lockedPaths } = await collectSessionChanges(codexHome, targetProvider);
-  const { writableChanges, lockedChanges } = await splitLockedSessionChanges(codexHome, changes);
+  const offsetThreadIds = await readOffsetAddressedThreadIds(codexHome);
+  const { changes, lockedPaths, oversized } = await collectSessionChanges(codexHome, targetProvider, { offsetThreadIds });
+  const { writableChanges, lockedChanges, liveChanges } = await splitLockedSessionChanges(codexHome, changes);
 
   // Verify the database is writable before rewriting any rollout file, so we
   // do not touch files only to discover the database is locked afterwards.
@@ -153,15 +159,20 @@ async function runSyncLocked({ codexHome, provider }) {
     ...applied.skippedPaths
   ]);
   const threadIdByPath = new Map(changes.map((change) => [change.path, change.threadId]));
-  const skippedThreadIds = skippedLockedRolloutFiles
-    .map((filePath) => threadIdByPath.get(filePath))
-    .filter((threadId) => typeof threadId === "string");
+  const skippedThreadIds = [
+    ...skippedLockedRolloutFiles.map((filePath) => threadIdByPath.get(filePath)),
+    ...oversized.map((entry) => entry.threadId)
+  ].filter((threadId) => typeof threadId === "string");
+  const oversizedRolloutFiles = oversized.map((entry) => entry.path);
+  const appliedPaths = new Set(applied.appliedPaths);
 
   let sqliteResult;
   try {
+    // Rows of untouched rollouts keep their provider and creator, so the two
+    // stores agree.
     sqliteResult = await updateSqliteProvider(codexHome, targetProvider, {
       skippedThreadIds,
-      skippedRolloutPaths: skippedLockedRolloutFiles
+      skippedRolloutPaths: [...skippedLockedRolloutFiles, ...oversizedRolloutFiles]
     });
   } catch (error) {
     return restoreAndThrow(changesAt(applied.appliedPaths), error);
@@ -172,6 +183,8 @@ async function runSyncLocked({ codexHome, provider }) {
     targetProvider,
     changedSessionFiles: applied.appliedPaths.length,
     skippedLockedRolloutFiles,
+    oversizedRolloutFiles,
+    liveRolloutFiles: liveChanges.map((change) => change.path).filter((filePath) => appliedPaths.has(filePath)),
     sqliteRowsUpdated: sqliteResult.updatedRows,
     sqlitePresent: sqliteResult.databasePresent
   };

@@ -27,6 +27,8 @@ const EXCLUSIVE_OPEN_FLAGS = fs.constants.O_RDWR | UV_FS_O_EXLOCK;
  * @property {number} originalSize
  * @property {number} originalMtimeMs
  * @property {string} updatedFirstLine
+ * @property {boolean} inPlace the updated header, padded with spaces, has the
+ *   original's byte length and is written over it instead of replacing the file
  */
 
 /**
@@ -245,6 +247,75 @@ async function replaceFirstLine(filePath, firstLine, separator, expected) {
   }
 }
 
+/**
+ * Overwrites a rollout's first line with one of the same byte length, in place.
+ * Codex only appends to a rollout and records byte offsets into it (its
+ * paginated history in thread_history_1.sqlite, and the history_base of forked
+ * threads), so an equal-length header keeps every offset valid and is safe to
+ * write while Codex has the file open: nothing it appends is lost. With
+ * `expected`, the file is left alone ("changed") unless its header is still
+ * exactly the collected one.
+ * @param {string} filePath
+ * @param {string} firstLine
+ * @param {string} [expectedFirstLine]
+ * @returns {Promise<RewriteStatus>}
+ */
+async function overwriteFirstLine(filePath, firstLine, expectedFirstLine) {
+  /** @type {fsp.FileHandle} */
+  let handle;
+  try {
+    handle = await fsp.open(filePath, IS_WINDOWS ? EXCLUSIVE_OPEN_FLAGS : "r+");
+  } catch (error) {
+    if (isNotFound(error)) {
+      return "missing";
+    }
+    if (isRolloutFileBusyError(error)) {
+      return "busy";
+    }
+    throw error;
+  }
+  try {
+    const current = await readFirstLine(handle);
+    const replacement = Buffer.from(firstLine, "utf8");
+    // Compared on disk bytes: a write longer than the header would run into
+    // the next line.
+    if (
+      (expectedFirstLine !== undefined && current.firstLine !== expectedFirstLine)
+      || headerByteLength(current) !== replacement.length
+    ) {
+      return "changed";
+    }
+    for (let written = 0; written < replacement.length;) {
+      const { bytesWritten } = await handle.write(replacement, written, replacement.length - written, written);
+      if (bytesWritten === 0) {
+        throw new Error(`Could not write the header of ${filePath}`);
+      }
+      written += bytesWritten;
+    }
+    return "applied";
+  } catch (error) {
+    throw wrapRolloutFileBusyError(error, filePath, "rewrite");
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * The first line's length on disk, without its line break.
+ * @param {FirstLineRecord} record
+ */
+function headerByteLength(record) {
+  return record.offset - record.separator.length;
+}
+
+/**
+ * @param {string} line
+ * @param {number} byteLength
+ */
+function padToByteLength(line, byteLength) {
+  return line + " ".repeat(byteLength - Buffer.byteLength(line, "utf8"));
+}
+
 /** @param {string[]} filePaths */
 async function realpathMap(filePaths) {
   const byRealPath = new Map();
@@ -347,20 +418,46 @@ async function findOpenFiles(filePaths) {
   return findOpenFilesWithLsof(filePaths);
 }
 
+// Codex 0.171+ keeps byte offsets into a rollout: its paginated history
+// (history_mode "paginated" in the header, or only in SQLite for a thread it
+// promoted) and the history_base of the threads forked from it. A header that
+// grows or shrinks shifts every one of them, after which Codex fails to load
+// that history ("durable rollout shrank before projection"), so such a rollout
+// is only ever rewritten in place.
+/**
+ * @param {Record<string, unknown>} payload
+ * @param {Set<string>} offsetThreadIds threads paginated in SQLite, and the ids
+ *   of the threads a fork points into
+ */
+function hasByteOffsets(payload, offsetThreadIds) {
+  return payload.history_mode === "paginated"
+    || Object.hasOwn(payload, "history_base")
+    || (typeof payload.id === "string" && offsetThreadIds.has(payload.id));
+}
+
 /**
  * Reads every rollout's header: counts its provider, and, unless `statusOnly`,
  * records the change that moves it to `targetProvider` and clears its account
  * scope. Files another process has locked for reading are listed, not read.
+ * A rollout whose new header would be longer, and that Codex addresses by byte
+ * offset, can't be rewritten without breaking its history: it is listed in
+ * `oversized` and left alone.
  * @param {string} codexHome
  * @param {string | null} targetProvider
- * @param {{ statusOnly?: boolean }} [options]
+ * @param {{ statusOnly?: boolean, offsetThreadIds?: Set<string> }} [options]
+ *   offsetThreadIds: the threads SQLite says Codex addresses by byte offset
  */
-export async function collectSessionChanges(codexHome, targetProvider, { statusOnly = false } = {}) {
+export async function collectSessionChanges(codexHome, targetProvider, { statusOnly = false, offsetThreadIds = new Set() } = {}) {
   /** @type {RolloutChange[]} */
   const changes = [];
   /** @type {string[]} */
   const lockedPaths = [];
+  /** @type {{ path: string, threadId: string | null }[]} */
+  const oversized = [];
   const providerCounts = /** @type {ProviderCounts} */ (Object.fromEntries(SESSION_DIRS.map((dirName) => [dirName, new Map()])));
+  /** @type {{ path: string, record: FirstLineRecord, parsed: { payload: Record<string, any> }, stat: fs.Stats }[]} */
+  const pending = [];
+  const byteOffsetIds = new Set(offsetThreadIds);
 
   for (const dirName of SESSION_DIRS) {
     let rolloutPaths;
@@ -381,6 +478,10 @@ export async function collectSessionChanges(codexHome, targetProvider, { statusO
           lockedPaths.push(rolloutPath);
           continue;
         }
+        // Archived or deleted by Codex since the listing.
+        if (isNotFound(error)) {
+          continue;
+        }
         throw error;
       }
       const parsed = parseSessionMetaRecord(record.firstLine);
@@ -391,26 +492,62 @@ export async function collectSessionChanges(codexHome, targetProvider, { statusO
       const counts = providerCounts[dirName];
       counts.set(currentProvider, (counts.get(currentProvider) ?? 0) + 1);
 
+      const forkedFrom = parsed.payload.history_base?.thread_id;
+      if (typeof forkedFrom === "string") {
+        byteOffsetIds.add(forkedFrom);
+      }
       if (statusOnly || (parsed.payload.model_provider === targetProvider && !hasAccountScope(parsed.payload))) {
         continue;
       }
-      const stat = await fsp.stat(rolloutPath);
-      parsed.payload.model_provider = targetProvider;
-      clearAccountScope(parsed.payload);
-      changes.push({
-        path: rolloutPath,
-        threadId: parsed.payload.id ?? null,
-        originalFirstLine: record.firstLine,
-        originalSeparator: record.separator,
-        originalOffset: record.offset,
-        originalSize: stat.size,
-        originalMtimeMs: stat.mtimeMs,
-        updatedFirstLine: JSON.stringify(parsed)
-      });
+      // Codex writes valid UTF-8. A header that isn't decodes to more bytes
+      // than it has on disk, which a rewrite must not guess at.
+      if (Buffer.byteLength(record.firstLine, "utf8") !== headerByteLength(record)) {
+        continue;
+      }
+      let stat;
+      try {
+        stat = await fsp.stat(rolloutPath);
+      } catch (error) {
+        if (isNotFound(error)) {
+          continue;
+        }
+        throw error;
+      }
+      pending.push({ path: rolloutPath, record, parsed, stat });
     }
   }
 
-  return { changes, lockedPaths, providerCounts };
+  // A header that couldn't be read may be a fork pointing into any rollout.
+  const unknownForks = lockedPaths.length > 0;
+  for (const { path: rolloutPath, record, parsed, stat } of pending) {
+    const keepsOffsets = unknownForks || hasByteOffsets(parsed.payload, byteOffsetIds);
+    parsed.payload.model_provider = targetProvider;
+    clearAccountScope(parsed.payload);
+    const updated = JSON.stringify(parsed);
+    // Space before the line break is JSON whitespace: the padded header parses
+    // the same, and the room it leaves lets later switches stay in place too.
+    const length = headerByteLength(record);
+    const room = length - Buffer.byteLength(updated, "utf8");
+    const threadId = typeof parsed.payload.id === "string" ? parsed.payload.id : null;
+    if (room < 0 && keepsOffsets) {
+      oversized.push({ path: rolloutPath, threadId });
+      continue;
+    }
+    changes.push({
+      path: rolloutPath,
+      threadId,
+      originalFirstLine: record.firstLine,
+      originalSeparator: record.separator,
+      originalOffset: record.offset,
+      originalSize: stat.size,
+      originalMtimeMs: stat.mtimeMs,
+      updatedFirstLine: room >= 0 ? padToByteLength(updated, length) : updated,
+      inPlace: room >= 0
+    });
+  }
+
+  oversized.sort((left, right) => left.path.localeCompare(right.path));
+  return { changes, lockedPaths, oversized, providerCounts };
 }
 
 /** @param {string[]} paths */
@@ -431,7 +568,9 @@ export async function applySessionChanges(changes) {
   for (const change of changes) {
     let status;
     try {
-      status = await replaceFirstLine(change.path, change.updatedFirstLine, change.originalSeparator, change);
+      status = change.inPlace
+        ? await overwriteFirstLine(change.path, change.updatedFirstLine, change.originalFirstLine)
+        : await replaceFirstLine(change.path, change.updatedFirstLine, change.originalSeparator, change);
     } catch (error) {
       throw new RolloutRewriteError(errorMessage(error), { appliedPaths: [...appliedPaths], cause: error });
     }
@@ -462,10 +601,12 @@ async function writerLocksOf(codexHome, changes) {
   return locks;
 }
 
-// Rewrites replace the rollout file, so a running Codex that still has it open
-// would keep appending to the replaced file and lose those events. A thread is
-// in use when its rollout is open, or when Codex holds its writer lock open,
-// which also covers a writer that opens the rollout only to append.
+// A rewrite that doesn't fit in place replaces the rollout file, so a running
+// Codex that still has it open would keep appending to the replaced file and
+// lose those events. A thread is in use when its rollout is open, or when Codex
+// holds its writer lock open, which also covers a writer that opens the rollout
+// only to append. An in-place rewrite is safe next to an appending Codex; only
+// Windows, where Codex's open handle blocks cx's exclusive open, still waits.
 /**
  * Splits off the changes whose thread another process is writing.
  * @param {string} codexHome
@@ -476,9 +617,14 @@ export async function splitLockedSessionChanges(codexHome, changes) {
   const openPaths = new Set(await findOpenFiles([...changes.map((change) => change.path), ...writerLocks.values()]));
   /** @param {RolloutChange} change */
   const inUse = (change) => openPaths.has(change.path) || openPaths.has(writerLocks.get(change) ?? "");
+  /** @param {RolloutChange} change */
+  const waits = (change) => inUse(change) && (IS_WINDOWS || !change.inPlace);
   return {
-    writableChanges: changes.filter((change) => !inUse(change)),
-    lockedChanges: changes.filter(inUse)
+    writableChanges: changes.filter((change) => !waits(change)),
+    lockedChanges: changes.filter(waits),
+    // Rewritten while Codex runs them: it may write the creator tags it holds
+    // in memory back to SQLite until it closes them.
+    liveChanges: changes.filter((change) => inUse(change) && !waits(change))
   };
 }
 
@@ -517,9 +663,11 @@ export async function restoreSessionChanges(changes) {
   const failures = [];
   for (const change of changes) {
     try {
-      const status = await replaceFirstLine(change.path, change.originalFirstLine, change.originalSeparator);
+      const status = change.inPlace
+        ? await overwriteFirstLine(change.path, change.originalFirstLine)
+        : await replaceFirstLine(change.path, change.originalFirstLine, change.originalSeparator);
       if (status !== "applied") {
-        failures.push({ path: change.path, message: status === "busy" ? "in use" : "file is gone" });
+        failures.push({ path: change.path, message: { busy: "in use", changed: "header changed", missing: "file is gone" }[status] });
       }
     } catch (error) {
       failures.push({ path: change.path, message: errorMessage(error) });

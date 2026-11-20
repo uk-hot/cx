@@ -377,23 +377,44 @@ On a `switch` (and its underlying sync), `cx`:
    collects those whose `session_meta` first line has a different provider or
    carries a creator tag (`account_scoped`, `creator_user_id`,
    `creator_account_id`), which is removed.
-4. Skips rollout files another process still has open (a running Codex session
-   would otherwise keep appending to the replaced file and lose those events).
-5. Verifies the SQLite database is writable, then **rewrites the rollout files
+4. Rewrites each header **in place** when the new one fits: it is padded with
+   spaces (JSON whitespace) to the old header's exact byte length. Codex 0.171+
+   records byte offsets into rollouts (the paginated history in
+   `thread_history_1.sqlite`, and the `history_base` of forked threads), and an
+   equal-length header keeps every one of them valid. Codex only appends to a
+   rollout, so this is also safe while a running Codex has the file open.
+   Removing the creator tags usually leaves room, and the padding keeps that
+   room for later switches. A header with invalid UTF-8 (which Codex never
+   writes) is left alone.
+5. A header that grows (a longer provider name and no tags to remove) needs the
+   file replaced. That is skipped for files another process still has open (a
+   running Codex session would otherwise keep appending to the replaced file and
+   lose those events), and never done for a rollout Codex addresses by byte
+   offset (paginated according to its header, `state_5.sqlite` or
+   `thread_history_1.sqlite`, forked, or forked from; when some header can't be
+   read, any rollout could be a fork's parent): `cx` leaves it on its provider
+   and reports it instead of breaking its history.
+6. Verifies the SQLite database is writable, then **rewrites the rollout files
    first** (outside any DB transaction) and **updates SQLite in a short
    transaction** — keeping the database lock brief regardless of file count.
    The transaction also clears the `creator_user_id`/`creator_account_id`
    columns; Codex fills empty columns from the rollout file, so both stores must
    be cleared. Rows of skipped rollout files keep their provider and creator.
-6. If the SQLite update fails, the already-rewritten rollout files are rolled
+7. If the SQLite update fails, the already-rewritten rollout files are rolled
    back, so the two stores do not diverge.
+8. After restarting the Codex app-server daemon, syncs once more: the daemon's
+   sessions write their creator tags from memory back to SQLite as it shuts
+   down, and Codex never replaces a creator that is already set. Without a
+   restart, `cx switch` says how many open sessions it rewrote, since a Codex
+   still running them can tag them again until it closes them.
 
 Open files are detected via `/proc` on Linux, `lsof` on macOS, and an exclusive
 open on Windows, which cx keeps while it rewrites the file so Codex cannot open
-it in between. A thread whose writer lock (`~/.codex/thread-writer-locks/`,
-Codex 0.168+) is held open counts as in use too, even while its rollout file is
-closed. Skipped files are reported rather than corrupted; re-run
-`cx switch` after closing Codex to sync them.
+it in between (so on Windows even in-place rewrites wait for Codex to close the
+file). A thread whose writer lock (`~/.codex/thread-writer-locks/`, Codex
+0.168+) is held open counts as in use too, even while its rollout file is
+closed. Skipped files are reported rather than corrupted; re-run `cx switch`
+after closing Codex to sync them.
 
 ## Data & safety
 
@@ -420,6 +441,17 @@ closed. Skipped files are reported rather than corrupted; re-run
 
 ### Unreleased
 
+- `cx switch` keeps the sessions of the previous account visible even when
+  Codex had them open: the rollout header is rewritten in place, padded to its
+  old length, instead of the file being replaced. Before, an open session was
+  skipped and stayed hidden from the new account (with Codex 0.171 the daemon
+  reopens it right after its restart, so the re-sync skipped it again), and the
+  shorter header shifted the byte offsets Codex 0.171 keeps into the rollout, so
+  Codex stopped recording new turns of those sessions ("durable rollout shrank
+  before projection"). A rollout whose header would have to grow and that Codex
+  addresses by byte offset is left on its provider and reported.
+- After restarting the daemon, `cx switch` always syncs again, clearing the
+  creator tags the daemon's sessions wrote back to SQLite while it shut down.
 - New `cx sessions`: `cx` now records which account each session belongs to
   (the one that used it last; Codex's creator tags are read before
   `cx switch` clears them), lists the sessions by account, and
