@@ -97,6 +97,8 @@ cx add            # identity (email, account id) is auto-detected
 cx add work       # also gives the new account an alias
 ```
 
+`delete` and `assign` can't be aliases: `cx sessions` reads them as its actions.
+
 Close Codex before running `cx add`. If you exit Codex without signing in, the
 previous login is restored. Signing in to a registered account refreshes its
 credentials instead of adding a duplicate, which also recovers an expired or
@@ -342,7 +344,8 @@ another owner is left alone (`cx` says which).
   skipped too.
 - Codex appends to `history.jsonl` while it runs, so close Codex before a
   delete if you can. If the prompts or leftover files of deleted sessions can't
-  be removed, the next `cx sessions` command finishes it.
+  be removed, or the delete is interrupted, the next `cx sessions` command
+  finishes it.
 - Codex rebuilds its consolidated memory (`~/.codex/memories`) without the
   deleted sessions the next time it runs with memories on; until then, what it
   had already merged in from them stays there.

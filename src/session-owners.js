@@ -51,13 +51,19 @@ const ACTIVITY_MARKERS = [...ACTIVITY_TYPES].map((type) => Buffer.from(`"${type}
  * @returns {Promise<ThreadOwners>}
  */
 export async function readThreadOwners(codexHome) {
-  const text = await readTextIfExists(codexPaths(codexHome).threadOwners);
+  const filePath = codexPaths(codexHome).threadOwners;
+  const text = await readTextIfExists(filePath);
   if (text === null) {
     return { version: OWNERS_VERSION, threads: {} };
   }
-  const data = JSON.parse(text);
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`${filePath} is not valid JSON (${error instanceof Error ? error.message : String(error)}). Fix it to use cx sessions.`);
+  }
   if (typeof data !== "object" || data === null || typeof data.threads !== "object" || data.threads === null) {
-    throw new Error(`${codexPaths(codexHome).threadOwners} is not a cx thread owner file.`);
+    throw new Error(`${filePath} is not a cx thread owner file.`);
   }
   return data;
 }
@@ -222,7 +228,9 @@ export async function recordSessionOwners(codexHome, registry, { liveLogin }) {
     /** @type {Omit<ThreadOwner, "at"> | null} */
     let next = null;
     if (trusted && thread.rolloutPath && (thread.updatedAtMs === null || thread.updatedAtMs >= windowStart)) {
-      const activity = await lastActivityMs(thread.rolloutPath);
+      // A rollout cx can't read counts as having no turn, rather than failing
+      // the record of every other thread.
+      const activity = await lastActivityMs(thread.rolloutPath).catch(() => null);
       // Only a turn after the owner was recorded changes it: a turn the
       // current owner was already credited for, or one from before a
       // `cx sessions assign`, doesn't.

@@ -379,6 +379,85 @@ test("prompts a delete couldn't remove are removed by a later cleanup", async (t
   assert.equal((await readThreadOwners(codexHome)).pending_cleanup, undefined);
 });
 
+test("a delete interrupted midway leaves what it already deleted to a later cleanup", async (t) => {
+  const codexHome = await makeHome(t);
+  await signIn(codexHome, "one");
+  await putThread(codexHome, "first", { turns: [await moment()] });
+  await putThread(codexHome, "second", { turns: [await moment()] });
+
+  const view = await loadSessions(codexHome);
+  await assert.rejects(deleteSessions(codexHome, { accountKey: view.registry.active_account_key, ids: ["first", "second"] }, {
+    deleteThread: fakeCodexDelete,
+    onProgress: () => {
+      throw new Error("interrupted");
+    }
+  }), /interrupted/);
+  const recorded = await readThreadOwners(codexHome);
+  // Newest first: "second" was deleted before the interruption.
+  assert.deepEqual(recorded.pending_cleanup, ["second"]);
+  assert.equal(recorded.threads.second, undefined);
+});
+
+test("cleanup never turns a hand-edited thread id into a path", async (t) => {
+  const codexHome = await makeHome(t);
+  await fsp.mkdir(path.join(codexHome, "accounts"), { recursive: true });
+  await fsp.writeFile(path.join(codexHome, "accounts", "threads.json"), JSON.stringify({ version: 1, threads: {}, pending_cleanup: ["../sessions"] }));
+  await fsp.writeFile(path.join(codexHome, "sessions", "rollout-x.jsonl"), "");
+
+  const cleanup = await finishSessionCleanup(codexHome);
+  assert.equal(cleanup.error, null);
+  assert.ok(fs.existsSync(path.join(codexHome, "sessions", "rollout-x.jsonl")));
+});
+
+test("a malformed threads.json is reported as such, not as a failed cleanup", async (t) => {
+  const codexHome = await makeHome(t);
+  await fsp.mkdir(path.join(codexHome, "accounts"), { recursive: true });
+  await fsp.writeFile(path.join(codexHome, "accounts", "threads.json"), "{ not json");
+  await assert.rejects(finishSessionCleanup(codexHome), /threads\.json is not valid JSON/);
+});
+
+test("an unreadable rollout doesn't stop the other threads from being credited", async (t) => {
+  const codexHome = await makeHome(t);
+  await signIn(codexHome, "two");
+  await signIn(codexHome, "one");
+  await putThread(codexHome, "used-by-one", { turns: [await moment()] });
+  const broken = await putThread(codexHome, "broken", { turns: [await moment()] });
+  // Reading a directory as a rollout fails with EISDIR.
+  await fsp.rm(broken);
+  await fsp.mkdir(broken);
+
+  await runSwitch({ codexHome, identifier: "two@example.com" });
+  assert.deepEqual(await owners(codexHome), { "used-by-one": "one/activity" });
+  await loadSessions(codexHome);
+});
+
+test("a prompt Codex appends to the replaced history file is carried over", { skip: process.platform === "win32" ? "POSIX rename semantics" : false }, async (t) => {
+  const codexHome = await makeHome(t);
+  await fsp.mkdir(path.join(codexHome, "accounts"), { recursive: true });
+  await fsp.writeFile(path.join(codexHome, "accounts", "threads.json"), JSON.stringify({ version: 1, threads: {}, pending_cleanup: ["gone"] }));
+  const historyPath = path.join(codexHome, "history.jsonl");
+  const line = (id, text) => `${JSON.stringify({ session_id: id, ts: 1, text })}\n`;
+  await fsp.writeFile(historyPath, line("gone", "secret") + line("keep", "kept"));
+  const { ino } = await fsp.stat(historyPath);
+  // A Codex that opened the file before cx replaced it.
+  const fd = fs.openSync(historyPath, "a");
+  t.after(() => fs.closeSync(fd));
+
+  const cleanup = finishSessionCleanup(codexHome);
+  while ((await fsp.stat(historyPath)).ino === ino) {
+    await sleep(5);
+  }
+  fs.writeSync(fd, line("new", "late"));
+  assert.equal((await cleanup).historyLinesRemoved, 1);
+  assert.equal(await fsp.readFile(historyPath, "utf8"), line("keep", "kept") + line("new", "late"));
+});
+
+test("cx add rejects aliases cx sessions reads as actions", async (t) => {
+  const codexHome = await makeHome(t);
+  await fsp.writeFile(path.join(codexHome, "auth.json"), oauthAuth("one"));
+  await assert.rejects(addAccount(codexHome, "delete"), /can't be an alias/);
+});
+
 test("deleteSessions skips a thread whose rollout another process has open", { skip: process.platform !== "linux" }, async (t) => {
   const codexHome = await makeHome(t);
   await signIn(codexHome, "one");

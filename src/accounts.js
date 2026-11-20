@@ -5,7 +5,7 @@ import { authDigest, parseAuthText } from "./auth-file.js";
 import { mergeAccountConfigText, readCurrentProviderFromConfigText } from "./config-file.js";
 import { DEFAULT_PROVIDER, codexPaths } from "./constants.js";
 import { fileExists, fileModeOr, isNotFound, readTextIfExists, writeFileAtomically } from "./fs-utils.js";
-import { LOCK_BUSY_CODE, acquireLock, withLock } from "./locking.js";
+import { LOCK_BUSY_CODE, acquireLock, withLock, withLockWhenFree } from "./locking.js";
 import {
   AUTH_SNAPSHOT_SUFFIX,
   accountDisplayName,
@@ -210,6 +210,16 @@ export async function syncActiveAccountFromCurrentAuth(codexHome) {
   }
 }
 
+// `cx sessions <alias>` would read these as its own actions.
+const RESERVED_ALIASES = new Set(["assign", "delete"]);
+
+/** @param {string | undefined} alias */
+function assertAliasAllowed(alias) {
+  if (alias !== undefined && RESERVED_ALIASES.has(alias)) {
+    throw new Error(`"${alias}" can't be an alias: cx sessions ${alias} is a command. Pick another alias.`);
+  }
+}
+
 /**
  * Registers what ~/.codex holds now (auth.json and config.toml) as an account.
  * @param {string} codexHome
@@ -217,6 +227,7 @@ export async function syncActiveAccountFromCurrentAuth(codexHome) {
  * @returns {Promise<AccountSummary>}
  */
 export async function addAccount(codexHome, alias) {
+  assertAliasAllowed(alias);
   const paths = codexPaths(codexHome);
   const authText = await readTextIfExists(paths.auth);
   const configText = await readTextIfExists(paths.config);
@@ -367,6 +378,8 @@ export async function addNeedsLogin(codexHome) {
  * @param {{ runCodex: () => Promise<unknown>, onCurrentSaved?: (saved: AccountSummary | null) => void }} hooks
  */
 export async function addAccountWithLogin(codexHome, alias, { runCodex, onCurrentSaved }) {
+  // Before the sign-in, not after it, when addAccount would reject it.
+  assertAliasAllowed(alias);
   const authPath = codexPaths(codexHome).auth;
   const previousAuthText = await readTextIfExists(authPath);
   const previous = parseAuthText(previousAuthText);
@@ -376,8 +389,9 @@ export async function addAccountWithLogin(codexHome, alias, { runCodex, onCurren
 
   // The sign-in replaces the login, after which nothing tells whose the
   // threads used until now are. Saving the current account above credited
-  // them already, but an API key or a removed account isn't saved there.
-  await withLock(codexHome, "add", async () => {
+  // them already, but an API key or a removed account isn't saved there. A
+  // background cx warm may hold the lock for a moment: wait for it.
+  await withLockWhenFree(codexHome, "add", async () => {
     const outgoingLogin = liveLoginOf(previousAuthText, await readTextIfExists(codexPaths(codexHome).config));
     await tryRecordSessionOwners(codexHome, await readRegistry(codexHome), { liveLogin: outgoingLogin });
   });

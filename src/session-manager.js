@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import { liveLoginOf } from "./accounts.js";
 import { codexPaths } from "./constants.js";
@@ -36,8 +37,17 @@ const CODEX_COMMAND_TIMEOUT_MS = 60 * 1000;
 const MIN_ID_PREFIX = 4;
 // history.jsonl is rewritten only when Codex didn't append to it meanwhile.
 const HISTORY_ATTEMPTS = 5;
+// A Codex that opened history.jsonl just before cx replaced it appends to the
+// old file. Codex retries its lock on the file for up to a second before
+// writing, so cx keeps copying what lands there until it has been quiet this long.
+const HISTORY_SETTLE_MS = 1500;
+const HISTORY_SETTLE_MAX_MS = 10 * 1000;
+const HISTORY_POLL_MS = 100;
 // Sessions deleted per hold of the cx lock: a few seconds of `codex delete`.
 const DELETE_BATCH_SIZE = 25;
+// Cleanup turns thread ids into file names: an id that isn't a single plain
+// path component (a hand-edited threads.json) is never used as one.
+const SAFE_THREAD_ID = /^[A-Za-z0-9_-]+$/;
 
 /**
  * Credits the threads used since the active account's activation to it, then
@@ -304,14 +314,52 @@ async function codexDelete(codexHome, threadId) {
 }
 
 /**
+ * Copies what Codex appends to the replaced history file until it has been
+ * quiet for a while: a Codex that opened the file before the rename writes
+ * there, not to the new one (POSIX only; see removeHistoryLines).
+ * @param {import("node:fs/promises").FileHandle} oldHandle
+ * @param {number} copied bytes of it already in the new file
+ * @param {string} historyPath
+ */
+async function carryOverAppends(oldHandle, copied, historyPath) {
+  const start = Date.now();
+  let quietSince = start;
+  while (Date.now() - quietSince < HISTORY_SETTLE_MS && Date.now() - start < HISTORY_SETTLE_MAX_MS) {
+    const { size } = await oldHandle.stat();
+    if (size > copied) {
+      const appended = Buffer.alloc(size - copied);
+      await oldHandle.read(appended, 0, appended.length, copied);
+      await fs.appendFile(historyPath, appended);
+      copied = size;
+      quietSince = Date.now();
+    }
+    await sleep(HISTORY_POLL_MS);
+  }
+}
+
+/** @param {unknown} error */
+function isBusyOnWindows(error) {
+  const code = /** @type {NodeJS.ErrnoException} */ (error)?.code;
+  return process.platform === "win32" && (code === "EPERM" || code === "EACCES" || code === "EBUSY");
+}
+
+/**
  * Drops the prompts of deleted threads from Codex's prompt history. Codex
- * appends to it while it runs: a rewrite that raced an append is retried, and
- * an append that lands in the old file just before the rename is carried over.
+ * appends to it while it runs, opening it for each prompt, and Node can't
+ * take the file lock Codex holds while writing. So a rewrite that raced an
+ * append is retried, and the file is replaced with a rename:
+ * - POSIX: an append to the old file (by a Codex that opened it just before
+ *   the rename) is carried over to the new one.
+ * - Windows: a file another process has open can't be replaced, so the
+ *   rename fails and is retried while Codex is appending; cx closes its own
+ *   handle before the last check, so nothing can land between it and the rename
+ *   but a whole open-write-close by Codex.
  * @param {string} historyPath
  * @param {Set<string>} threadIds
  */
 async function removeHistoryLines(historyPath, threadIds) {
   for (let attempt = 1; attempt <= HISTORY_ATTEMPTS; attempt += 1) {
+    /** @type {import("node:fs/promises").FileHandle | null} */
     let handle;
     try {
       handle = await fs.open(historyPath, "r");
@@ -340,21 +388,26 @@ async function removeHistoryLines(historyPath, threadIds) {
       }
       await fs.writeFile(temporaryPath, kept.join("\n"), { encoding: "utf8", mode: before.mode & 0o777 });
       await fs.chmod(temporaryPath, before.mode & 0o777);
+      if (process.platform === "win32") {
+        // Windows can't replace a file that is still open, cx's handle included.
+        await handle.close();
+        handle = null;
+      }
       const now = await fs.stat(historyPath);
       if (now.ino !== before.ino || now.size !== before.size || now.mtimeMs !== before.mtimeMs) {
         continue;
       }
-      if (process.platform === "win32") {
-        // Windows can't replace a file that is still open.
-        await handle.close();
-        handle = null;
+      try {
+        await fs.rename(temporaryPath, historyPath);
+      } catch (error) {
+        if (isBusyOnWindows(error)) {
+          await sleep(HISTORY_POLL_MS);
+          continue;
+        }
+        throw error;
       }
-      await fs.rename(temporaryPath, historyPath);
-      const after = handle ? await handle.stat() : before;
-      if (handle && after.size > before.size) {
-        const appended = Buffer.alloc(after.size - before.size);
-        await handle.read(appended, 0, appended.length, before.size);
-        await fs.appendFile(historyPath, appended);
+      if (handle) {
+        await carryOverAppends(handle, before.size, historyPath);
       }
       return removed;
     } finally {
@@ -391,30 +444,52 @@ async function removeThreadLeftovers(codexHome, threadId) {
  */
 
 /**
- * Removes what deleted sessions leave outside Codex's stores: their prompts in
- * history.jsonl and their leftover files. The sessions are recorded as pending
- * first, so a cleanup that fails (or is interrupted) is finished by a later
- * `cx sessions`. Never throws: the sessions are gone either way.
+ * Records sessions `codex delete` just removed: they lose their owner, and
+ * their prompts and leftover files are to be removed by finishSessionCleanup.
+ * Done right after each delete, so a delete that is interrupted later still
+ * leaves them to a later `cx sessions`. Callers hold the cx lock.
  * @param {string} codexHome
- * @param {string[]} [deletedIds] sessions just deleted
+ * @param {string[]} deletedIds
+ */
+async function markCleanupPending(codexHome, deletedIds) {
+  if (deletedIds.length === 0) {
+    return;
+  }
+  const owners = await readThreadOwners(codexHome);
+  for (const id of deletedIds) {
+    delete owners.threads[id];
+  }
+  owners.pending_cleanup = [...new Set([...(owners.pending_cleanup ?? []), ...deletedIds])];
+  await writeThreadOwners(codexHome, owners);
+}
+
+/** @returns {CleanupResult} */
+const nothingCleaned = () => ({ sessions: 0, historyLinesRemoved: 0, error: null });
+
+/**
+ * Removes what deleted sessions leave outside Codex's stores: their prompts in
+ * history.jsonl and their leftover files. They were recorded as pending when
+ * they were deleted, so a cleanup that fails (or is interrupted) is finished
+ * by a later `cx sessions`. Throws only when threads.json is unreadable; any
+ * other failure is returned, as the sessions are gone either way.
+ * @param {string} codexHome
  * @returns {Promise<CleanupResult>}
  */
-export async function finishSessionCleanup(codexHome, deletedIds = []) {
+export async function finishSessionCleanup(codexHome) {
+  if (!(await readThreadOwners(codexHome)).pending_cleanup?.length) {
+    return nothingCleaned();
+  }
   try {
-    return await withLockWhenFree(codexHome, "sessions-delete", async () => {
+    return await withLockWhenFree(codexHome, "sessions-cleanup", async () => {
       const owners = await readThreadOwners(codexHome);
-      const pending = new Set([...(owners.pending_cleanup ?? []), ...deletedIds]);
+      const pending = new Set(owners.pending_cleanup ?? []);
       if (pending.size === 0) {
-        return { sessions: 0, historyLinesRemoved: 0, error: null };
+        return nothingCleaned();
       }
-      for (const id of deletedIds) {
-        delete owners.threads[id];
-      }
-      owners.pending_cleanup = [...pending];
-      await writeThreadOwners(codexHome, owners);
-
       for (const id of pending) {
-        await removeThreadLeftovers(codexHome, id);
+        if (typeof id === "string" && SAFE_THREAD_ID.test(id)) {
+          await removeThreadLeftovers(codexHome, id);
+        }
       }
       const historyLinesRemoved = await removeHistoryLines(codexPaths(codexHome).history, pending);
       delete owners.pending_cleanup;
@@ -422,7 +497,7 @@ export async function finishSessionCleanup(codexHome, deletedIds = []) {
       return { sessions: pending.size, historyLinesRemoved, error: null };
     });
   } catch (error) {
-    return { sessions: 0, historyLinesRemoved: 0, error: errorMessage(error) };
+    return { ...nothingCleaned(), error: errorMessage(error) };
   }
 }
 
@@ -520,7 +595,9 @@ export async function deleteSessions(codexHome, confirmed, { deleteThread = code
         if (group.members.some((member) => inUse.has(member.thread.id))) {
           result.inUse.push(...group.members.map((member) => member.thread.id));
         } else {
+          const deletedBefore = result.deleted.length;
           await deleteGroup(codexHome, group, deleteThread, result);
+          await markCleanupPending(codexHome, result.deleted.slice(deletedBefore));
         }
         done += group.members.length;
         onProgress?.(done, total);
@@ -528,6 +605,7 @@ export async function deleteSessions(codexHome, confirmed, { deleteThread = code
     });
   }
 
-  result.cleanup = await finishSessionCleanup(codexHome, result.deleted);
+  result.cleanup = await finishSessionCleanup(codexHome)
+    .catch((error) => ({ ...nothingCleaned(), error: errorMessage(error) }));
   return result;
 }
