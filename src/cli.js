@@ -25,6 +25,15 @@ import {
 import { getStatus, renderStatus, runSwitch, runSync } from "./service.js";
 import { shellArgument } from "./terminal-ui.js";
 import { renderAccountUsage } from "./usage-service.js";
+import {
+  backgroundWarmStatus,
+  claimWatcher,
+  reviveBackgroundWarm,
+  startBackgroundWarm,
+  stopBackgroundWarm
+} from "./warm-daemon.js";
+import { isCodexActive } from "./codex-activity.js";
+import { nextWarmCheck, renderWarmChanges, renderWarmResults, warmAccounts, warmFailed } from "./warm-service.js";
 
 /** @typedef {import("./registry.js").Account} Account */
 /** @typedef {import("./service.js").SyncResult} SyncResult */
@@ -36,7 +45,8 @@ const codexHome = defaultCodexHome();
  * @property {string} usage
  * @property {string[]} summary help text, one entry per line
  * @property {number} maxArgs
- * @property {(args: string[]) => Promise<void>} run
+ * @property {string[]} [flags] long options the command accepts besides --help
+ * @property {(args: string[], flags: Record<string, unknown>) => Promise<void>} run
  */
 
 /** @type {Record<string, Command>} */
@@ -58,6 +68,18 @@ const COMMANDS = {
     summary: ["Sign in to a new account, or again to a registered", "one whose login expired or was signed out"],
     maxArgs: 1,
     run: ([alias]) => addAccountCommand(alias)
+  },
+  warm: {
+    usage: "cx warm [start|stop|--watch]",
+    summary: [
+      "Start weekly quota windows that haven't started yet (and",
+      "5-hour ones while Codex is in use);",
+      "start: keep doing it in the background as each one",
+      "resets; stop: turn that off; --watch: same, in this terminal"
+    ],
+    maxArgs: 1,
+    flags: ["watch"],
+    run: ([action], flags) => warmCommand(action, Boolean(flags.watch))
   },
   list: {
     usage: "cx list",
@@ -220,6 +242,8 @@ async function printStatus() {
     localError = error;
   }
   console.log(await renderAccountUsage(codexHome));
+  console.log("");
+  console.log(await renderBackgroundWarm());
   if (localError) {
     throw localError;
   }
@@ -273,6 +297,123 @@ async function addAccountCommand(alias) {
   await restartDaemonForNewLogin();
 }
 
+const WATCH_POLL_MS = 60 * 1000;
+
+// Sleeps toward a wall-clock target in short steps, since a timer doesn't count
+// the time a machine spends suspended. Wakes early when `wakeEarly` says so.
+/**
+ * @param {number} target ms
+ * @param {() => Promise<boolean>} wakeEarly
+ */
+async function sleepUntil(target, wakeEarly) {
+  for (let left = target - Date.now(); left > 0; left = target - Date.now()) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(left, WATCH_POLL_MS)));
+    if (await wakeEarly()) {
+      return;
+    }
+  }
+}
+
+/** Codex activity, or false when it can't be told. */
+async function codexActiveNow() {
+  return isCodexActive(codexHome).catch(() => false);
+}
+
+/** @param {number} ms */
+function localTime(ms) {
+  const date = new Date(ms);
+  const pad = (/** @type {number} */ value) => String(value).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+const WARM_RETRY_COOLDOWN_MS = 60 * 60 * 1000;
+
+async function renderBackgroundWarm() {
+  try {
+    const { pid, log } = await backgroundWarmStatus(codexHome);
+    return pid === null
+      ? "Background warm: off (cx warm start turns it on)"
+      : `Background warm: running (pid ${pid}), log: ${log}`;
+  } catch (error) {
+    return `Background warm: unknown (${errorMessage(error)})`;
+  }
+}
+
+/**
+ * @param {string | undefined} action
+ * @param {boolean} watch
+ */
+async function warmCommand(action, watch) {
+  if (action !== undefined && (watch || !["start", "stop"].includes(action))) {
+    throw new Error(`Usage: ${COMMANDS.warm.usage}`);
+  }
+  if (action === "start") {
+    const result = await startBackgroundWarm(codexHome);
+    console.log(result.status === "started"
+      ? `cx warm runs in the background (pid ${result.pid}). Log: ${result.log}`
+      : `cx warm already runs in the background (pid ${result.pid}). Log: ${result.log}`);
+    console.log("Any cx command starts it again after a reboot; cx warm stop turns it off.");
+    return;
+  }
+  if (action === "stop") {
+    const result = await stopBackgroundWarm(codexHome);
+    console.log(result.status === "stopped" ? `Stopped cx warm (pid ${result.pid}).` : "cx warm was not running.");
+    return;
+  }
+  if (!watch) {
+    const results = await warmAccounts(codexHome, { codexActive: await codexActiveNow() });
+    console.log(renderWarmResults(results));
+    if (warmFailed(results)) {
+      process.exitCode = 1;
+    }
+    return;
+  }
+
+  const claim = await claimWatcher(codexHome);
+  if (!claim.claimed) {
+    throw new Error(`cx warm already runs (pid ${claim.pid}). Stop it first: cx warm stop`);
+  }
+  for (const signal of /** @type {const} */ (["SIGINT", "SIGTERM", "SIGHUP"])) {
+    process.once(signal, () => process.exit(0));
+  }
+  // An account whose request failed isn't sent another one for a while, so a
+  // revoked login doesn't start Codex on every check.
+  /** @type {Map<string, number>} */
+  const failedAt = new Map();
+  /** @type {Map<string, string>} */
+  let lastState = new Map();
+  for (;;) {
+    let next;
+    // While Codex is in use, idle 5-hour windows are started too.
+    const codexActive = await codexActiveNow();
+    try {
+      const results = await warmAccounts(codexHome, {
+        codexActive,
+        skip: (accountKey) => Date.now() - (failedAt.get(accountKey) ?? -Infinity) < WARM_RETRY_COOLDOWN_MS
+      });
+      for (const result of results) {
+        if (result.attempted && (result.outcome === "failed" || result.outcome === "unconfirmed")) {
+          failedAt.set(result.accountKey, Date.now());
+        } else if (result.attempted) {
+          failedAt.delete(result.accountKey);
+        }
+      }
+      const report = renderWarmChanges(results, lastState);
+      lastState = report.state;
+      if (report.text) {
+        console.log(`[${localTime(Date.now())}]\n${report.text}`);
+      }
+      next = nextWarmCheck(results, Date.now(), { codexActive });
+    } catch (error) {
+      console.warn(`[${localTime(Date.now())}] ${errorMessage(error)}`);
+      next = Date.now() + 5 * 60 * 1000;
+    }
+    console.log(`Next check: ${localTime(next)}${codexActive ? "" : ", or as soon as Codex is used"}`);
+    // Starting to use Codex is a reason to check at once, for the 5-hour windows.
+    await sleepUntil(next, async () => !codexActive && await codexActiveNow());
+  }
+}
+
 async function listAccountsCommand() {
   await syncActiveAccountFromCurrentAuth(codexHome);
   const accounts = await listAccounts(codexHome);
@@ -297,7 +438,7 @@ function parseCommandLine(argv) {
   try {
     return parseArgs({
       args: argv,
-      options: { help: { type: "boolean", short: "h" } },
+      options: { help: { type: "boolean", short: "h" }, watch: { type: "boolean" } },
       allowPositionals: true,
       strict: true
     });
@@ -323,7 +464,17 @@ async function main() {
   if (args.length > command.maxArgs) {
     throw new Error(`Too many arguments. Usage: ${command.usage}`);
   }
-  await command.run(args);
+  const { help: _help, ...flags } = values;
+  const unknownFlag = Object.keys(flags).find((flag) => !command.flags?.includes(flag));
+  if (unknownFlag) {
+    throw new Error(`Unknown option '--${unknownFlag}' for cx ${name}. Usage: ${command.usage}`);
+  }
+  if (name !== "warm") {
+    await reviveBackgroundWarm(codexHome).catch((error) => {
+      console.warn(`Could not start the background cx warm: ${errorMessage(error)}`);
+    });
+  }
+  await command.run(args, flags);
 }
 
 // Wrapped errors keep the error that caused them; show it unless the message

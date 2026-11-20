@@ -14,9 +14,9 @@ const LOW_QUOTA_PERCENT = 30;
 const CRITICAL_QUOTA_PERCENT = 10;
 const FIVE_HOUR_COLUMN = 2;
 const WEEKLY_COLUMN = 3;
-const SIGN_IN_EXPIRED = "sign-in expired";
-const SIGNED_OUT = "signed out";
-const NO_SAVED_LOGIN = "no saved login";
+export const SIGN_IN_EXPIRED = "sign-in expired";
+export const SIGNED_OUT = "signed out";
+export const NO_SAVED_LOGIN = "no saved login";
 
 /** @typedef {import("./registry.js").Account} Account */
 /**
@@ -25,9 +25,13 @@ const NO_SAVED_LOGIN = "no saved login";
  * @typedef {(url: string, init: { headers: Record<string, string>, signal: AbortSignal }) => Promise<{ status: number, ok: boolean, json(): Promise<unknown> }>} FetchFn
  */
 /** @typedef {{ accessToken: string, accountId: string, expiresAt: number | null }} Credentials */
-/** @typedef {{ remainingPercent: number, resetsAt: number | null, windowSeconds: number | null }} Quota */
+/**
+ * idle: the window hasn't started. A window starts with the first request after
+ * the previous one ended, not when that one ended.
+ * @typedef {{ remainingPercent: number, resetsAt: number | null, windowSeconds: number | null, idle: boolean }} Quota
+ */
 /** @typedef {{ plan: string | null, fiveHour: Quota | null, weekly: Quota | null, other: Quota[] }} Usage */
-/** @typedef {{ label: string, active: boolean, error?: string } & Partial<Usage>} UsageRow */
+/** @typedef {{ accountKey: string, label: string, active: boolean, error?: string } & Partial<Usage>} UsageRow */
 
 // Usage limits exist only for ChatGPT sign-ins to OpenAI itself: API keys and
 // third-party providers have none.
@@ -73,10 +77,15 @@ function toQuota(window) {
   if (!Number.isFinite(window?.used_percent)) {
     return null;
   }
+  const windowSeconds = Number.isFinite(window.limit_window_seconds) ? window.limit_window_seconds : null;
+  // A window that hasn't started always resets a full window from now; one that
+  // has started counts down, even while its rounded use is still 0%.
+  const resetAfter = Number.isFinite(window.reset_after_seconds) ? window.reset_after_seconds : null;
   return {
     remainingPercent: Math.min(100, Math.max(0, 100 - window.used_percent)),
     resetsAt: Number.isFinite(window.reset_at) ? window.reset_at : null,
-    windowSeconds: Number.isFinite(window.limit_window_seconds) ? window.limit_window_seconds : null
+    windowSeconds,
+    idle: window.used_percent === 0 && windowSeconds !== null && resetAfter !== null && resetAfter >= windowSeconds
   };
 }
 
@@ -183,12 +192,13 @@ async function createProxyAwareTransport() {
 // expired or was signed out instead. One account failing never affects the others.
 /**
  * @param {string} codexHome
- * @param {{ fetchFn?: FetchFn, now?: number }} [options]
+ * @param {{ fetchFn?: FetchFn, now?: number, accountKeys?: string[] }} [options] accountKeys: only these accounts
  * @returns {Promise<UsageRow[]>}
  */
-export async function getAccountUsage(codexHome, { fetchFn, now = Date.now() } = {}) {
+export async function getAccountUsage(codexHome, { fetchFn, now = Date.now(), accountKeys } = {}) {
   const registry = await readRegistry(codexHome);
-  const accounts = registry.accounts.filter(isOfficialAccount);
+  const accounts = registry.accounts.filter((account) => isOfficialAccount(account)
+    && (!accountKeys || accountKeys.includes(account.account_key)));
   if (!accounts.length) {
     return [];
   }
@@ -208,6 +218,7 @@ export async function getAccountUsage(codexHome, { fetchFn, now = Date.now() } =
   try {
     return await Promise.all(accounts.map(async (account) => {
       const row = {
+        accountKey: account.account_key,
         label: accountDisplayName(account),
         // The registry alone goes stale when Codex is logged in to a login cx
         // doesn't know, and auth.json alone can't tell that a third-party
@@ -229,7 +240,7 @@ export async function getAccountUsage(codexHome, { fetchFn, now = Date.now() } =
 }
 
 /** @param {number} seconds */
-function formatDuration(seconds) {
+export function formatDuration(seconds) {
   const minutes = Math.ceil(Math.max(0, seconds) / 60);
   if (minutes < 60) {
     return `${minutes}m`;
@@ -249,6 +260,9 @@ function formatQuota(quota, nowSeconds) {
     return "-";
   }
   const percent = `${Math.round(quota.remainingPercent)}%`;
+  if (quota.idle) {
+    return `${percent} (not started)`;
+  }
   return quota.resetsAt === null
     ? percent
     : `${percent} (resets in ${formatDuration(quota.resetsAt - nowSeconds)})`;

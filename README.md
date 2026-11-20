@@ -26,6 +26,7 @@ npm install -g @uk-hot/cx
 cx status
 cx switch <email|alias>
 cx add [alias]
+cx warm [start|stop|--watch]
 cx list
 cx remove <email|alias>
 ```
@@ -50,6 +51,7 @@ ACCOUNT USAGE
 +---------------------+------+------------------------+-------------------------+
 ```
 
+A window that hasn't started yet shows `not started` (see [`cx warm`](#cx-warm-startstop--watch)).
 API-key logins and third-party providers have no such limits and are left out. A
 plan without a limit shows `-`, and a limit of any other length gets an
 `OTHER LIMITS` column. An account that cannot be read shows why, and the others
@@ -186,6 +188,75 @@ run.
 A missing `config.toml` is fine: it means Codex's defaults, i.e. the `openai`
 provider.
 
+### `cx warm [start|stop|--watch]`
+
+A weekly quota window doesn't start when the previous one ends, but with the
+first request after that. An account left unused after its weekly reset keeps a
+full but idle window, and its next week only starts when it is used again, so
+every idle hour pushes its next reset back. `cx warm` starts every idle weekly
+window right away with the smallest Codex request there is:
+
+```text
+$ cx warm
+one@example.com  weekly window started (resets in 7d 0h)
+two@example.com  weekly window running (22% left, resets in 5d 20h)
+```
+
+To have that happen on its own as soon as each window resets, run it in the
+background:
+
+```bash
+cx warm start   # runs in the background from now on
+cx warm stop    # stops it and turns it off
+```
+
+The background `cx warm` checks again a minute after the earliest weekly reset
+of all accounts, at least every 30 minutes (which picks up added or renewed
+accounts), and 5 minutes after a failure that may pass. An account whose
+request failed is not sent another one for an hour. It logs to
+`~/.codex/log/cx-warm.log` (the state of every account on start, then only
+what changed),
+and `cx status` shows whether it runs. It stops with the machine, and any `cx`
+command starts it again until `cx warm stop`. `cx warm --watch` does the same in
+the terminal instead; only one of them runs at a time.
+
+It works apart from the Codex you are using:
+
+- Each request runs in a private Codex home under `~/.codex/tmp/` holding a copy
+  of the account's login, also for the account Codex is logged in to. It is
+  `codex exec --ephemeral` with the prompt `Reply with OK.`, without your
+  `config.toml`, rules, project, sessions or app-server daemon, and uses a
+  sliver of the quota (and starts the 5-hour window as well). It usually takes
+  under a minute per account, and is given up after 3.
+- `cx` holds its lock only for the moment it saves tokens, never while Codex
+  runs, so `cx switch` and the other commands keep working.
+- Codex refreshes old tokens on the way. A refresh token is single-use, so `cx`
+  saves the refreshed tokens back to the account's snapshot, and to
+  `~/.codex/auth.json` while Codex is logged in to that account (never older
+  ones over newer). A running Codex rereads `auth.json` before it refreshes a
+  token or after one is rejected, so it picks them up. The private home is then
+  removed; one left behind by an interrupted run is recovered by the next.
+
+Which accounts are sent a request:
+
+- A window is idle when it is 0% used and resets a whole window from now; `cx
+  status` shows it as `not started`. Only accounts signed in with ChatGPT have
+  one.
+- Every idle weekly window.
+- While you use Codex, every idle 5-hour window too, of the accounts with at
+  least 10% of their week left. The account you work with started its own 5-hour
+  window, and the others then have theirs already running down when you switch
+  to them. If you keep working past a 5-hour reset, the window is started again
+  a minute after it ends; once you stop, they are left alone. Codex counts as in
+  use while one of its sessions (terminal or app) was written to in the last 10
+  minutes; the background `cx warm` notices within a minute that you started.
+- An account whose saved sign-in expired can't report its quota, so it is sent
+  the request as well: it renews the sign-in. Accounts that are signed out or
+  have no saved login are only reported.
+
+`cx warm` without `start` makes one pass and exits with status 1 if a request
+failed, or went through but the window still shows as not started.
+
 ### `cx list`
 
 Lists the accounts registered in the registry (email/alias and provider), marking the
@@ -238,16 +309,34 @@ closed. Skipped files are reported rather than corrupted; re-run
 ## Data & safety
 
 - `cx` reads and writes only under `~/.codex`.
-- `cx status` sends each OpenAI account's access token to
+- `cx status` and `cx warm` send each OpenAI account's access token to
   `https://chatgpt.com/backend-api/wham/usage`, an undocumented endpoint that
   Codex calls too and that may change without notice. No other command contacts
   a usage API, and the result is not cached or written anywhere.
+- `cx warm` runs `codex exec` as each account whose weekly window is idle, which
+  sends one short request to OpenAI and may refresh that account's tokens. The
+  private Codex home it uses for that holds a copy of the account's login while
+  it runs.
 - `cx add` copies your `auth.json` (OAuth tokens or API keys) and `config.toml`
   into `~/.codex/accounts/`, readable by the owner only. Treat that directory as
   sensitive.
 - Close Codex and the Codex app before switching if files are reported as locked.
 
 ## Changelog
+
+### Unreleased
+
+- New `cx warm`: starts every account's weekly quota window that hasn't
+  started yet with a minimal `codex exec` request, so an unused account's next
+  week starts at its reset rather than at its next use. While Codex is in use,
+  it also starts the idle 5-hour windows of accounts with at least 10% of their
+  week left, again after each reset until Codex is no longer used. `cx warm start` keeps
+  doing it in the background a minute after each reset (any `cx` command starts
+  it again after a reboot; `cx warm stop` turns it off), `cx warm --watch` in
+  the terminal. Each request runs in a private Codex home, apart from `~/.codex`
+  and without holding the cx lock; tokens Codex refreshes there are saved back.
+- `cx status` shows a 5-hour or weekly window that hasn't started as
+  `100% (not started)` instead of a reset time that keeps moving.
 
 ### 0.3.0
 

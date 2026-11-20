@@ -122,8 +122,8 @@ test("every account is queried with its own token, the logged-in one from auth.j
     ["two@example.com", false]
   ]);
   assert.equal(rows[0].plan, "team");
-  assert.deepEqual(rows[0].fiveHour, { remainingPercent: 75, resetsAt: 1000 + 3 * 3600, windowSeconds: 18000 });
-  assert.deepEqual(rows[0].weekly, { remainingPercent: 40, resetsAt: 1000 + 2 * 86400, windowSeconds: 604800 });
+  assert.deepEqual(rows[0].fiveHour, { remainingPercent: 75, resetsAt: 1000 + 3 * 3600, windowSeconds: 18000, idle: false });
+  assert.deepEqual(rows[0].weekly, { remainingPercent: 40, resetsAt: 1000 + 2 * 86400, windowSeconds: 604800, idle: false });
   assert.deepEqual(rows[0].other, []);
 });
 
@@ -189,7 +189,7 @@ test("windows are told apart by length, not position", async (t) => {
   });
 
   assert.equal(row.fiveHour, null);
-  assert.deepEqual(row.weekly, { remainingPercent: 70, resetsAt: 5000, windowSeconds: 604800 });
+  assert.deepEqual(row.weekly, { remainingPercent: 70, resetsAt: 5000, windowSeconds: 604800, idle: false });
 });
 
 test("a window that is neither 5h nor weekly is kept apart", async (t) => {
@@ -207,7 +207,7 @@ test("a window that is neither 5h nor weekly is kept apart", async (t) => {
     rate_limit: { primary_window: { used_percent: 40, limit_window_seconds: null, reset_at: 2000 } }
   });
   assert.equal(noLength.fiveHour, null);
-  assert.deepEqual(noLength.other, [{ remainingPercent: 60, resetsAt: 2000, windowSeconds: null }]);
+  assert.deepEqual(noLength.other, [{ remainingPercent: 60, resetsAt: 2000, windowSeconds: null, idle: false }]);
 });
 
 test("a second window of the same length is not dropped", async (t) => {
@@ -219,6 +219,36 @@ test("a second window of the same length is not dropped", async (t) => {
   });
   assert.equal(row.weekly.remainingPercent, 90);
   assert.deepEqual(row.other.map((quota) => quota.remainingPercent), [80]);
+});
+
+test("a window that hasn't started is told apart from one that started at 0%", async (t) => {
+  const row = await usageOf(t, "one", {
+    rate_limit: {
+      primary_window: { used_percent: 0, limit_window_seconds: 18000, reset_after_seconds: 18000, reset_at: 19000 },
+      secondary_window: { used_percent: 0, limit_window_seconds: 604800, reset_after_seconds: 561379, reset_at: 562379 }
+    }
+  });
+  assert.equal(row.fiveHour.idle, true);
+  assert.equal(row.weekly.idle, false);
+
+  const noCountdown = await usageOf(t, "two", {
+    rate_limit: { secondary_window: { used_percent: 0, limit_window_seconds: 604800, reset_at: 605800 } }
+  });
+  assert.equal(noCountdown.weekly.idle, false);
+});
+
+test("only the requested accounts are queried", async (t) => {
+  const one = accountFor("one");
+  const two = accountFor("two");
+  const codexHome = await makeHome(t, {
+    accounts: [one, two],
+    snapshots: { [one.account_key]: authFor("one"), [two.account_key]: authFor("two") }
+  });
+  const rows = await getAccountUsage(codexHome, {
+    accountKeys: [two.account_key],
+    fetchFn: async () => respondWith(usageBody())
+  });
+  assert.deepEqual(rows.map(({ accountKey }) => accountKey), [two.account_key]);
 });
 
 test("a plan without limits keeps its plan and is not an error", async (t) => {
@@ -418,6 +448,19 @@ test("the table shows what is left and when it resets", () => {
   assert.match(output, /\|   two@example\.com\s+\| plus\s+\| -\s+\| 0% \(resets in 1m\)/);
   assert.match(output, /\|   three@example\.com\s+\| -\s+\| sign-in expired\s+\| -/);
   assert.doesNotMatch(output, /OTHER LIMITS/);
+});
+
+test("a window that hasn't started says so instead of a reset time", () => {
+  const output = renderUsage([{
+    accountKey: "k",
+    label: "one@example.com",
+    active: false,
+    plan: "team",
+    fiveHour: { remainingPercent: 100, resetsAt: 1000 + 18000, windowSeconds: 18000, idle: true },
+    weekly: { remainingPercent: 100, resetsAt: 1000 + 604800, windowSeconds: 604800, idle: true },
+    other: []
+  }], { now: 1000 * 1000 });
+  assert.match(output, /\| 100% \(not started\)\s+\| 100% \(not started\)\s+\|/);
 });
 
 test("limits outside the two columns get their own, labelled by length", () => {

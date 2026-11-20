@@ -121,6 +121,26 @@ export async function readSqliteProviderCounts(codexHome) {
 }
 
 /**
+ * The rollout files of the threads Codex updated last, newest first.
+ * @param {string} codexHome
+ * @param {number} limit
+ * @returns {Promise<string[]>}
+ */
+export async function readRecentRolloutPaths(codexHome, limit) {
+  const db = await openStateDatabase(codexHome);
+  if (!db) {
+    return [];
+  }
+  try {
+    return db.prepare("SELECT rollout_path FROM threads ORDER BY updated_at DESC LIMIT ?")
+      .all(limit)
+      .map((row) => String(row.rollout_path));
+  } finally {
+    db.close();
+  }
+}
+
+/**
  * Takes and drops the write lock, so a sync fails before touching any file
  * when Codex holds the database.
  * @param {string} codexHome

@@ -32,7 +32,7 @@ async function readLockOwner(lockDir) {
 }
 
 /** @param {unknown} pid */
-function isProcessRunning(pid) {
+export function isProcessRunning(pid) {
   if (!Number.isInteger(pid) || /** @type {number} */ (pid) <= 0) {
     return false;
   }

@@ -51,7 +51,7 @@ async function readProviderFromConfig(codexHome) {
  * @param {string | null} authText
  * @param {string | null} configText
  */
-function liveLoginOf(authText, configText) {
+export function liveLoginOf(authText, configText) {
   return (providerOf(configText) ?? DEFAULT_PROVIDER) === DEFAULT_PROVIDER ? parseAuthText(authText) : null;
 }
 
@@ -59,7 +59,7 @@ function liveLoginOf(authText, configText) {
  * When Codex last refreshed the tokens of an auth.json, or null when unknown.
  * @param {string | null} authText
  */
-function lastRefreshMs(authText) {
+export function lastRefreshMs(authText) {
   try {
     const value = Date.parse(JSON.parse(authText ?? "null")?.last_refresh);
     return Number.isFinite(value) ? value : null;
