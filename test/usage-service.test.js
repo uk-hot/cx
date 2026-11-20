@@ -460,7 +460,30 @@ test("a window that hasn't started says so instead of a reset time", () => {
     weekly: { remainingPercent: 100, resetsAt: 1000 + 604800, windowSeconds: 604800, idle: true },
     other: []
   }], { now: 1000 * 1000 });
-  assert.match(output, /\| 100% \(not started\)\s+\| 100% \(not started\)\s+\|/);
+  assert.match(output, /\| 100% \(idle, 5h from first use\)\s+\| 100% \(idle, 7d from first use\)\s+\|/);
+});
+
+test("an idle 5-hour window says when the week is too low to use it", () => {
+  const idleFiveHour = { remainingPercent: 100, resetsAt: 1000 + 18000, windowSeconds: 18000, idle: true };
+  const weekly = (remainingPercent) => ({ remainingPercent, resetsAt: 1000 + 86400, windowSeconds: 604800, idle: false });
+  const output = renderUsage([
+    { accountKey: "a", label: "low@example.com", active: false, plan: "team", fiveHour: idleFiveHour, weekly: weekly(1), other: [] },
+    { accountKey: "b", label: "out@example.com", active: false, plan: "team", fiveHour: idleFiveHour, weekly: weekly(0.2), other: [] },
+    { accountKey: "c", label: "edge@example.com", active: false, plan: "team", fiveHour: idleFiveHour, weekly: weekly(10), other: [] },
+    {
+      accountKey: "d",
+      label: "used@example.com",
+      active: false,
+      plan: "team",
+      fiveHour: { remainingPercent: 40, resetsAt: 1000 + 600, windowSeconds: 18000, idle: false },
+      weekly: weekly(0),
+      other: []
+    }
+  ], { now: 1000 * 1000 });
+  assert.match(output, /low@example\.com\s+\| team \| 100% \(idle, weekly low\)/);
+  assert.match(output, /out@example\.com\s+\| team \| 100% \(idle, weekly out\)/);
+  assert.match(output, /edge@example\.com\s+\| team \| 100% \(idle, 5h from first use\)/);
+  assert.match(output, /used@example\.com\s+\| team \| 40% \(resets in 10m\)/);
 });
 
 test("limits outside the two columns get their own, labelled by length", () => {

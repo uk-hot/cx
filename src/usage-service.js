@@ -17,6 +17,11 @@ const WEEKLY_COLUMN = 3;
 export const SIGN_IN_EXPIRED = "sign-in expired";
 export const SIGNED_OUT = "signed out";
 export const NO_SAVED_LOGIN = "no saved login";
+// Below this much of the week left, an idle 5-hour window is left alone: cx
+// warm doesn't start it, and the table greys it out, since the week runs out
+// first.
+export const MIN_WEEKLY_PERCENT_FOR_FIVE_HOUR = 10;
+const WEEKLY_BLOCKED = /\(idle, weekly (low|out)\)$/;
 
 /** @typedef {import("./registry.js").Account} Account */
 /**
@@ -261,11 +266,35 @@ function formatQuota(quota, nowSeconds) {
   }
   const percent = `${Math.round(quota.remainingPercent)}%`;
   if (quota.idle) {
-    return `${percent} (not started)`;
+    return quota.windowSeconds === null
+      ? `${percent} (idle, starts on first use)`
+      : `${percent} (idle, ${formatWindowLength(quota.windowSeconds)} from first use)`;
   }
   return quota.resetsAt === null
     ? percent
     : `${percent} (resets in ${formatDuration(quota.resetsAt - nowSeconds)})`;
+}
+
+/**
+ * Whether so little of the week is left that the 5-hour window doesn't matter.
+ * @param {Quota | null | undefined} weekly
+ */
+export function weeklyTooLowForFiveHour(weekly) {
+  return Boolean(weekly) && /** @type {Quota} */ (weekly).remainingPercent < MIN_WEEKLY_PERCENT_FOR_FIVE_HOUR;
+}
+
+/**
+ * An idle 5-hour window says when the week stops it from being worth using.
+ * @param {UsageRow} row
+ * @param {number} nowSeconds
+ */
+function formatFiveHour(row, nowSeconds) {
+  const { fiveHour, weekly } = row;
+  if (fiveHour?.idle && weekly && weeklyTooLowForFiveHour(weekly)) {
+    const reason = Math.round(weekly.remainingPercent) <= 0 ? "out" : "low";
+    return `${Math.round(fiveHour.remainingPercent)}% (idle, weekly ${reason})`;
+  }
+  return formatQuota(fiveHour, nowSeconds);
 }
 
 /** @param {number | null} seconds */
@@ -294,6 +323,9 @@ function formatOtherQuotas(quotas, nowSeconds) {
 
 /** @param {string} cell */
 function quotaColor(cell) {
+  if (WEEKLY_BLOCKED.test(cell)) {
+    return ANSI.dim;
+  }
   const percent = Number.parseInt(cell, 10);
   if (!Number.isFinite(percent)) {
     return cell === "-" ? null : ANSI.yellow;
@@ -339,7 +371,7 @@ export function renderUsage(rows, { now = Date.now() } = {}) {
     const cells = [
       `${row.active ? "*" : " "} ${row.label}`,
       row.plan ?? "-",
-      row.error ?? formatQuota(row.fiveHour, nowSeconds),
+      row.error ?? formatFiveHour(row, nowSeconds),
       row.error ? "-" : formatQuota(row.weekly, nowSeconds)
     ];
     return showOther ? [...cells, formatOtherQuotas(row.other, nowSeconds)] : cells;

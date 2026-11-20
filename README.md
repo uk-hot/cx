@@ -55,7 +55,10 @@ ACCOUNT USAGE
 +---------------------+------+------------------------+-------------------------+
 ```
 
-A window that hasn't started yet shows `not started` (see [`cx warm`](#cx-warm-startstop--watch)).
+A window that hasn't started yet shows `idle, 5h from first use` (or `7d`; see
+[`cx warm`](#cx-warm-startstop--watch)). An idle 5-hour window of an account with
+less than 10% of its week left shows `idle, weekly low` (`weekly out` at 0%),
+greyed out: the week runs out first, and `cx warm` leaves it alone.
 API-key logins and third-party providers have no such limits and are left out. A
 plan without a limit shows `-`, and a limit of any other length gets an
 `OTHER LIMITS` column. An account that cannot be read shows why, and the others
@@ -250,7 +253,7 @@ It works apart from the Codex you are using:
 Which accounts are sent a request:
 
 - A window is idle when it is 0% used and resets a whole window from now; `cx
-  status` shows it as `not started`. Only accounts signed in with ChatGPT have
+  status` shows it as `idle`. Only accounts signed in with ChatGPT have
   one.
 - Every idle weekly window.
 - While you use Codex, every idle 5-hour window too, of the accounts with at
@@ -468,7 +471,9 @@ after closing Codex to sync them.
   the terminal. Each request runs in a private Codex home, apart from `~/.codex`
   and without holding the cx lock; tokens Codex refreshes there are saved back.
 - `cx status` shows a 5-hour or weekly window that hasn't started as
-  `100% (not started)` instead of a reset time that keeps moving.
+  `100% (idle, 5h from first use)` instead of a reset time that keeps moving,
+  and an idle 5-hour window of an account with less than 10% of its week left
+  as `idle, weekly low` (or `weekly out`), greyed out.
 
 ### 0.3.0
 

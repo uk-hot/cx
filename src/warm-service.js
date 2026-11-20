@@ -10,7 +10,15 @@ import { errorMessage, fileModeOr, isNotFound, readTextIfExists, writeFileAtomic
 import { isProcessRunning, startedSinceBoot, withLockWhenFree } from "./locking.js";
 import { DETACHED, killTree } from "./process-tree.js";
 import { readRegistry, snapshotPaths } from "./registry.js";
-import { NO_SAVED_LOGIN, SIGN_IN_EXPIRED, SIGNED_OUT, formatDuration, getAccountUsage } from "./usage-service.js";
+import {
+  MIN_WEEKLY_PERCENT_FOR_FIVE_HOUR,
+  NO_SAVED_LOGIN,
+  SIGN_IN_EXPIRED,
+  SIGNED_OUT,
+  formatDuration,
+  getAccountUsage,
+  weeklyTooLowForFiveHour
+} from "./usage-service.js";
 
 // A weekly (or 5-hour) window starts with the first request after the previous
 // one ended. Until then it shows as full and resetting a whole window from now,
@@ -53,7 +61,7 @@ const MAX_WATCH_INTERVAL_MS = 30 * 60 * 1000;
 const RETRY_INTERVAL_MS = 5 * 60 * 1000;
 const TRANSIENT_ERROR = /^(timed out|unreachable|HTTP 5\d\d)$/;
 // 5-hour windows are kept running only for accounts with this much of the week left.
-export const MIN_WEEKLY_PERCENT_FOR_FIVE_HOUR = 10;
+export { MIN_WEEKLY_PERCENT_FOR_FIVE_HOUR };
 
 /** @typedef {import("./usage-service.js").Quota} Quota */
 /** @typedef {import("./usage-service.js").UsageRow} UsageRow */
@@ -501,7 +509,7 @@ function delay(ms) {
  * @param {{ fiveHour?: Quota | null, weekly?: Quota | null }} usage
  */
 function fiveHourEligible({ fiveHour, weekly }) {
-  return Boolean(fiveHour) && (!weekly || weekly.remainingPercent >= MIN_WEEKLY_PERCENT_FOR_FIVE_HOUR);
+  return Boolean(fiveHour) && !weeklyTooLowForFiveHour(weekly);
 }
 
 /**
