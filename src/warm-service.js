@@ -7,7 +7,7 @@ import { lastRefreshMs, liveLoginOf } from "./accounts.js";
 import { parseAuthText } from "./auth-file.js";
 import { codexPaths } from "./constants.js";
 import { errorMessage, fileModeOr, isNotFound, readTextIfExists, writeFileAtomically } from "./fs-utils.js";
-import { LOCK_BUSY_CODE, isProcessRunning, withLock } from "./locking.js";
+import { LOCK_BUSY_CODE, isProcessRunning, startedSinceBoot, withLock } from "./locking.js";
 import { readRegistry, snapshotPaths } from "./registry.js";
 import { NO_SAVED_LOGIN, SIGN_IN_EXPIRED, SIGNED_OUT, formatDuration, getAccountUsage } from "./usage-service.js";
 
@@ -22,7 +22,7 @@ const WARM_PROMPT = "Reply with OK.";
 // The prompt goes in on stdin: on Windows Codex runs through a shell, which
 // would split an argument with spaces. --ephemeral writes no session, and the
 // user's config (MCP servers, profiles, a third-party provider) and rules stay
-// out of it.
+// out of it. Low reasoning effort keeps the quota the request uses small.
 const EXEC_ARGS = [
   "exec",
   "--ephemeral",
@@ -31,10 +31,16 @@ const EXEC_ARGS = [
   "--ignore-rules",
   "--sandbox",
   "read-only",
+  "-c",
+  "model_reasoning_effort=low",
   "--json",
   "-"
 ];
 const EXEC_TIMEOUT_MS = 3 * 60 * 1000;
+// How long a killed Codex gets to go before cx stops waiting for it.
+const KILL_GRACE_MS = 5000;
+// How often the warm-up home is checked for tokens Codex refreshed.
+const TOKEN_POLL_MS = 1000;
 const WARM_DIR_PREFIX = "cx-warm-";
 const WARM_OWNER_FILE = "cx-owner.json";
 // A warm-up home without an owner file is being created, unless it is this old.
@@ -54,13 +60,18 @@ export const MIN_WEEKLY_PERCENT_FOR_FIVE_HOUR = 10;
 /** @typedef {import("./usage-service.js").UsageRow} UsageRow */
 /** @typedef {import("./usage-service.js").FetchFn} FetchFn */
 /** @typedef {{ ok: boolean, detail: string | null }} ExecResult */
-/** @typedef {(options: { codexHome: string, cwd: string }) => Promise<ExecResult>} RunExec */
+/**
+ * onSpawn: told the pid of the Codex process once it runs.
+ * @typedef {(options: { codexHome: string, cwd: string, onSpawn?: (pid: number) => void }) => Promise<ExecResult>} RunExec
+ */
 /**
  * started: the window (weekly, or 5h while Codex is in use) was idle and runs now. renewed: the saved sign-in
- * had expired, so the quota was unknown; the request renewed it. unconfirmed:
- * the request went through but the window still shows as not started. waiting:
- * a recent attempt failed, so this one waits.
- * @typedef {"started" | "renewed" | "unconfirmed" | "failed" | "waiting" | "running" | "no-weekly" | "error"} WarmOutcome
+ * had expired, so the quota was unknown; the request renewed it. renews-on-use:
+ * the sign-in of the account Codex is logged in to expired; Codex renews it
+ * when used, and a request meanwhile would race it for the refresh token.
+ * unconfirmed: the request went through but the window still shows as not
+ * started. waiting: a recent attempt failed, so this one waits.
+ * @typedef {"started" | "renewed" | "renews-on-use" | "unconfirmed" | "failed" | "waiting" | "running" | "no-weekly" | "error"} WarmOutcome
  * window: the window a request was for.
  * @typedef {{ accountKey: string, label: string, outcome: WarmOutcome, attempted: boolean, window?: "weekly" | "5h", detail?: string, weekly?: Quota | null, fiveHour?: Quota | null }} WarmResult
  */
@@ -99,37 +110,84 @@ export function interpretExecOutput(code, stdout, stderr) {
   return { ok: false, detail: failure ?? lastStderrLine ?? `codex exited with code ${code}` };
 }
 
-/**
- * On Windows Codex runs under cmd.exe, and killing that leaves Codex running:
- * end the whole tree.
- * @param {import("node:child_process").ChildProcess} child
- */
+// Every process the Codex command starts must end with it: one that outlives cx
+// may still refresh tokens in a warm-up home after cx saved and removed it. On
+// POSIX Codex runs in a process group of its own, which is killed as a whole
+// (the npm launcher may run the native binary as a child of its own); on
+// Windows it runs under cmd.exe, and the whole tree is ended.
+
+/** @type {Set<import("node:child_process").ChildProcess>} */
+const activeExecs = new Set();
+
+/** @param {import("node:child_process").ChildProcess} child */
 function killTree(child) {
-  if (process.platform === "win32" && child.pid) {
+  if (!child.pid) {
+    return;
+  }
+  if (process.platform === "win32") {
     spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true }).on("error", () => {});
-  } else {
-    child.kill("SIGKILL");
+    return;
+  }
+  try {
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    // The group is gone.
+  }
+}
+
+/**
+ * Whether the Codex started as `pid` still runs, with anything it started.
+ * @param {unknown} pid
+ */
+function execRunning(pid) {
+  if (!Number.isInteger(pid) || /** @type {number} */ (pid) <= 0) {
+    return false;
+  }
+  if (process.platform === "win32") {
+    return isProcessRunning(pid);
+  }
+  try {
+    process.kill(-(/** @type {number} */ (pid)), 0);
+    return true;
+  } catch (error) {
+    return /** @type {NodeJS.ErrnoException} */ (error)?.code === "EPERM";
+  }
+}
+
+/**
+ * Ends the Codex requests this process is sending, for when cx itself is
+ * stopped; the next cx warm recovers their warm-up homes.
+ */
+export function stopActiveExecs() {
+  for (const child of activeExecs) {
+    killTree(child);
   }
 }
 
 /**
  * Runs one non-interactive Codex turn in `codexHome`. It runs in process, not
  * through the app-server daemon, so it uses exactly the login in that home.
- * @param {{ codexHome: string, cwd: string, timeoutMs?: number }} options
+ * @param {{ codexHome: string, cwd: string, timeoutMs?: number, onSpawn?: (pid: number) => void }} options
  * @returns {Promise<ExecResult>}
  */
-export function runCodexExec({ codexHome, cwd, timeoutMs = EXEC_TIMEOUT_MS }) {
+export function runCodexExec({ codexHome, cwd, timeoutMs = EXEC_TIMEOUT_MS, onSpawn }) {
   return new Promise((resolve, reject) => {
     const child = spawn("codex", EXEC_ARGS, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, CODEX_HOME: codexHome },
+      detached: process.platform !== "win32",
       // npm installs codex as a .cmd shim on Windows, which needs a shell.
       shell: process.platform === "win32"
     });
+    if (child.pid) {
+      activeExecs.add(child);
+      onSpawn?.(child.pid);
+    }
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let timedOut = false;
     /** @param {ExecResult} result */
     const settle = (result) => {
       if (!settled) {
@@ -145,14 +203,16 @@ export function runCodexExec({ codexHome, cwd, timeoutMs = EXEC_TIMEOUT_MS }) {
     });
     // Codex may exit before reading the prompt.
     child.stdin.on("error", () => {});
-    const timer = setTimeout(() => {
+    let timer = setTimeout(() => {
+      timedOut = true;
       killTree(child);
       // A Codex that survives the kill may hold the pipes open, so don't wait
-      // for them to close.
-      settle({ ok: false, detail: "codex timed out" });
+      // for them to close for long.
+      timer = setTimeout(() => settle({ ok: false, detail: "codex timed out" }), KILL_GRACE_MS);
     }, timeoutMs);
     child.once("error", (error) => {
       clearTimeout(timer);
+      activeExecs.delete(child);
       settled = true;
       reject(/** @type {NodeJS.ErrnoException} */ (error)?.code === "ENOENT"
         ? new Error("The codex command was not found. Install Codex, then run cx warm again.", { cause: error })
@@ -160,7 +220,12 @@ export function runCodexExec({ codexHome, cwd, timeoutMs = EXEC_TIMEOUT_MS }) {
     });
     child.once("close", (code) => {
       clearTimeout(timer);
-      settle(interpretExecOutput(code, stdout, stderr));
+      activeExecs.delete(child);
+      if (process.platform !== "win32") {
+        // Anything Codex left running in its group.
+        killTree(child);
+      }
+      settle(timedOut ? { ok: false, detail: "codex timed out" } : interpretExecOutput(code, stdout, stderr));
     });
     child.stdin.end(`${WARM_PROMPT}\n`);
   });
@@ -259,10 +324,12 @@ async function recoverWarmDir(codexHome, accountKey, warmDir) {
 }
 
 /**
- * A warm-up home is in use while the cx that owns it runs. One owned by this
- * process is left over from an earlier pass whose save failed: a process warms
- * one account at a time. One without an owner file is still being set up,
- * unless it is old.
+ * A warm-up home is in use while the cx that owns it runs, and while the Codex
+ * it started does, which may outlive a cx that was killed. One owned by this
+ * process whose Codex ended is left over from an earlier pass whose save
+ * failed: a process warms one account at a time. Pids recorded before the
+ * machine started don't count. One without an owner file is still being set
+ * up, unless it is old.
  * @param {string} warmDir
  * @returns {Promise<"gone" | "in-use" | "abandoned">}
  */
@@ -283,7 +350,9 @@ async function warmDirState(warmDir) {
     // Not written yet, or the run died before writing it.
   }
   if (owner) {
-    return owner.pid !== process.pid && isProcessRunning(owner.pid) ? "in-use" : "abandoned";
+    const current = startedSinceBoot(owner.startedAt);
+    const ownerRuns = owner.pid !== process.pid && isProcessRunning(owner.pid);
+    return current && (ownerRuns || execRunning(owner.execPid)) ? "in-use" : "abandoned";
   }
   return Date.now() - stat.mtimeMs < OWNERLESS_WARM_DIR_STALE_MS ? "in-use" : "abandoned";
 }
@@ -325,12 +394,65 @@ async function currentAuthTextOf(codexHome, accountKey) {
 }
 
 /**
+ * Whether Codex is logged in to the account.
+ * @param {string} codexHome
+ * @param {string} accountKey
+ */
+async function isLoggedInTo(codexHome, accountKey) {
+  const paths = codexPaths(codexHome);
+  return liveLoginOf(await readTextIfExists(paths.auth), await readTextIfExists(paths.config))?.accountKey === accountKey;
+}
+
+/**
+ * Saves the tokens Codex refreshes in a warm-up home as soon as they appear,
+ * not only once Codex is done. Until then a Codex using the same login
+ * elsewhere (the account Codex is logged in to, or one `cx switch` just
+ * switched to) would refresh with a refresh token already used up, which signs
+ * the account out.
+ * @param {string} codexHome
+ * @param {string} accountKey
+ * @param {string} warmDir
+ * @param {string} initialText the auth.json the home started with
+ */
+function watchRefreshedTokens(codexHome, accountKey, warmDir, initialText) {
+  const authPath = path.join(warmDir, "auth.json");
+  let stopped = false;
+  let wake = () => {};
+  const loop = (async () => {
+    let seen = initialText;
+    while (!stopped) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, TOKEN_POLL_MS);
+        wake = () => {
+          clearTimeout(timer);
+          resolve(undefined);
+        };
+      });
+      const text = stopped ? null : await readTextIfExists(authPath).catch(() => null);
+      if (text !== null && text !== seen) {
+        // A half-written file is passed over, and saved once it is complete.
+        seen = text;
+        // They are saved again once Codex is done, so a failure only costs time.
+        await withLockWhenFree(codexHome, () => saveRefreshedTokens(codexHome, accountKey, warmDir)).catch(() => {});
+      }
+    }
+  })();
+  return {
+    async stop() {
+      stopped = true;
+      wake();
+      await loop;
+    }
+  };
+}
+
+/**
  * Sends one minimal Codex turn as the account from a private Codex home that
  * holds a copy of its login, so nothing in ~/.codex is used: not its config,
  * sessions, logs or daemon, and not the cx lock, so `cx switch` keeps working
- * meanwhile. Tokens Codex refreshes there are saved back afterwards. The home
- * itself marks the account as being warmed, so two cx runs never warm the same
- * account at once.
+ * meanwhile. Tokens Codex refreshes there are saved back as soon as they
+ * appear. The home itself marks the account as being warmed, so two cx runs
+ * never warm the same account at once.
  * @param {string} codexHome
  * @param {string} accountKey
  * @param {{ runExec?: RunExec }} [options]
@@ -342,9 +464,12 @@ export async function warmAccount(codexHome, accountKey, { runExec = runCodexExe
   if (!await claimDir(warmDir) && !(await recoverWarmDir(codexHome, accountKey, warmDir) && await claimDir(warmDir))) {
     return { ok: false, busy: true, detail: "another cx warm is sending a request as this account" };
   }
+  const owner = { pid: process.pid, startedAt: new Date().toISOString() };
+  /** @param {{ execPid?: number }} [extra] */
+  const writeOwner = (extra = {}) => writeFileAtomically(ownerFileOf(warmDir), JSON.stringify({ ...owner, ...extra }));
   let keepWarmDir = false;
   try {
-    await fs.writeFile(ownerFileOf(warmDir), JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+    await writeOwner();
     const authText = await currentAuthTextOf(codexHome, accountKey);
     if (authText === null) {
       return { ok: false, detail: NO_SAVED_LOGIN };
@@ -352,9 +477,28 @@ export async function warmAccount(codexHome, accountKey, { runExec = runCodexExe
     await writeFileAtomically(path.join(warmDir, "auth.json"), authText);
     // Keep this machine's Codex installation id instead of minting a new one.
     await fs.copyFile(path.join(codexHome, "installation_id"), path.join(warmDir, "installation_id")).catch(() => {});
+    /** @type {number | undefined} */
+    let execPid;
+    /** @type {Promise<void>} */
+    let ownerUpdated = Promise.resolve();
+    const tokenWatch = watchRefreshedTokens(codexHome, accountKey, warmDir, authText);
     try {
-      return await runExec({ codexHome: warmDir, cwd: warmDir });
+      return await runExec({
+        codexHome: warmDir,
+        cwd: warmDir,
+        onSpawn: (pid) => {
+          execPid = pid;
+          // So that a later cx leaves the home alone while this Codex runs,
+          // should this cx be killed first.
+          ownerUpdated = writeOwner({ execPid: pid }).catch(() => {});
+        }
+      });
     } finally {
+      await tokenWatch.stop();
+      await ownerUpdated;
+      // A Codex that survived being killed may still refresh tokens there: the
+      // home stays for a later run to recover once it ended.
+      keepWarmDir = execRunning(execPid);
       try {
         await withLockWhenFree(codexHome, () => saveRefreshedTokens(codexHome, accountKey, warmDir));
       } catch (error) {
@@ -429,7 +573,8 @@ function classify(row, codexActive) {
 /**
  * One pass over every official account. A weekly window that hasn't started is
  * started with a minimal Codex turn, and so is an account whose saved sign-in
- * expired, because its quota can't be read otherwise. While Codex is in use,
+ * expired, because its quota can't be read otherwise, unless Codex is logged in
+ * to it. While Codex is in use,
  * so is every 5-hour window that hasn't started, of the accounts with at least
  * MIN_WEEKLY_PERCENT_FOR_FIVE_HOUR of their week left: the account being used
  * started its own, and the others are then ready to take over with a window
@@ -458,6 +603,13 @@ export async function warmAccounts(codexHome, {
     }
     const window = /** @type {"weekly" | "5h"} */ (reason === "5h" ? "5h" : "weekly");
     const base = { accountKey: row.accountKey, label: row.label, window };
+    // An expired sign-in is renewed on the first refresh, so a Codex started
+    // meanwhile would race the request for the refresh token. Codex renews the
+    // one it is logged in to itself when it is used.
+    if (reason === "expired" && await isLoggedInTo(codexHome, row.accountKey)) {
+      results.push({ accountKey: row.accountKey, label: row.label, outcome: "renews-on-use", attempted: false });
+      continue;
+    }
     if (skip(row.accountKey)) {
       results.push({ ...base, outcome: "waiting", attempted: false, weekly: row.weekly ?? null, fiveHour: row.fiveHour ?? null });
       continue;
@@ -531,6 +683,8 @@ function describe(result, nowSeconds) {
       return `${windowName} window started (${resetsIn(result.window === "5h" ? result.fiveHour : result.weekly, nowSeconds)})`;
     case "renewed":
       return `sign-in renewed; weekly window running (${left}${resetsIn(result.weekly, nowSeconds)})`;
+    case "renews-on-use":
+      return "sign-in expired; Codex is logged in to it and renews it when you use it";
     case "running":
       return `weekly window running (${left}${resetsIn(result.weekly, nowSeconds)})`;
     case "unconfirmed":

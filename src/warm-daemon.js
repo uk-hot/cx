@@ -2,15 +2,14 @@ import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { closeSync, openSync, readFileSync, unlinkSync } from "node:fs";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { codexPaths } from "./constants.js";
-import { isNotFound, readTextIfExists, writeFileAtomically } from "./fs-utils.js";
-import { isProcessRunning } from "./locking.js";
+import { errorMessage, isNotFound, readTextIfExists, writeFileAtomically } from "./fs-utils.js";
+import { isProcessRunning, startedSinceBoot } from "./locking.js";
 
 // `cx warm start` runs `cx warm --watch` as a detached background process and
 // remembers that it should run, so any later cx command starts it again after
@@ -22,6 +21,9 @@ const LOG_MAX_BYTES = 1024 * 1024;
 const START_TIMEOUT_MS = 5000;
 const STOP_TIMEOUT_MS = 5000;
 const POLL_MS = 100;
+// After the background watcher failed to start, cx commands don't try again for
+// this long, so each of them doesn't wait for it and warn.
+const REVIVE_RETRY_MS = 10 * 60 * 1000;
 const execFileAsync = promisify(execFile);
 
 /** @param {string} codexHome */
@@ -30,8 +32,39 @@ export function warmPaths(codexHome) {
   return {
     settings: path.join(paths.accounts, "cx-warm.json"),
     pid: path.join(paths.tmp, "cx-warm.pid"),
+    startFailed: path.join(paths.tmp, "cx-warm.start-failed"),
     log: path.join(codexHome, "log", "cx-warm.log")
   };
+}
+
+/**
+ * When the background watcher last failed to start, or null.
+ * @param {string} codexHome
+ * @returns {Promise<{ at: number, error: string } | null>}
+ */
+async function readStartFailure(codexHome) {
+  try {
+    const failure = JSON.parse(await readTextIfExists(warmPaths(codexHome).startFailed) ?? "null");
+    const at = Date.parse(failure?.at);
+    return Number.isFinite(at) ? { at, error: String(failure.error ?? "") } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @param {string} codexHome
+ * @param {unknown} error
+ */
+async function recordStartFailure(codexHome, error) {
+  const { startFailed } = warmPaths(codexHome);
+  await fs.mkdir(path.dirname(startFailed), { recursive: true });
+  await writeFileAtomically(startFailed, JSON.stringify({ at: new Date().toISOString(), error: errorMessage(error) }));
+}
+
+/** @param {string} codexHome */
+async function clearStartFailure(codexHome) {
+  await fs.rm(warmPaths(codexHome).startFailed, { force: true });
 }
 
 /** @param {number} ms */
@@ -81,8 +114,7 @@ async function watcherPidIn(text) {
     return null;
   }
   const pid = owner?.pid;
-  const bootedAt = Date.now() - os.uptime() * 1000;
-  if (!isProcessRunning(pid) || !(Date.parse(owner?.startedAt) > bootedAt)) {
+  if (!isProcessRunning(pid) || !startedSinceBoot(owner?.startedAt)) {
     return null;
   }
   const commandLine = await commandLineOf(pid);
@@ -219,6 +251,7 @@ async function spawnWatcher(codexHome) {
  */
 export async function startBackgroundWarm(codexHome) {
   await writeSettings(codexHome, true);
+  await clearStartFailure(codexHome);
   const { log } = warmPaths(codexHome);
   const running = await runningWatcherPid(codexHome);
   if (running !== null) {
@@ -228,14 +261,15 @@ export async function startBackgroundWarm(codexHome) {
 }
 
 /**
- * Turns the background watcher off and stops whichever watcher runs. Its
- * process group goes with it, so a Codex request it is sending ends too; the
- * next cx warm recovers what that request left behind.
+ * Turns the background watcher off and stops whichever watcher runs. On being
+ * stopped it ends the Codex request it is sending, if any; the next cx warm
+ * recovers what that request left behind.
  * @param {string} codexHome
  * @returns {Promise<{ status: "stopped" | "not-running", pid?: number }>}
  */
 export async function stopBackgroundWarm(codexHome) {
   await writeSettings(codexHome, false);
+  await clearStartFailure(codexHome);
   const pid = await runningWatcherPid(codexHome);
   if (pid === null) {
     return { status: "not-running" };
@@ -258,24 +292,41 @@ export async function stopBackgroundWarm(codexHome) {
 
 /**
  * Starts the background watcher again if it should run but doesn't, e.g.
- * after a reboot. Returns its pid when it started it.
+ * after a reboot. Returns its pid when it started it. After a failed start it
+ * waits REVIVE_RETRY_MS before trying again.
  * @param {string} codexHome
+ * @param {{ now?: number }} [options]
  */
-export async function reviveBackgroundWarm(codexHome) {
+export async function reviveBackgroundWarm(codexHome, { now = Date.now() } = {}) {
   if (!(await readSettings(codexHome)).background || await runningWatcherPid(codexHome) !== null) {
     return null;
   }
-  return spawnWatcher(codexHome);
+  const failure = await readStartFailure(codexHome);
+  if (failure && now - failure.at < REVIVE_RETRY_MS && failure.at <= now) {
+    return null;
+  }
+  try {
+    const pid = await spawnWatcher(codexHome);
+    await clearStartFailure(codexHome);
+    return pid;
+  } catch (error) {
+    await recordStartFailure(codexHome, error).catch(() => {});
+    throw error;
+  }
 }
 
 /**
+ * background: whether it should run; startFailure: why it last failed to
+ * start, while that is unresolved.
  * @param {string} codexHome
- * @returns {Promise<{ background: boolean, pid: number | null, log: string }>}
+ * @returns {Promise<{ background: boolean, pid: number | null, log: string, startFailure: { at: number, error: string } | null }>}
  */
 export async function backgroundWarmStatus(codexHome) {
+  const pid = await runningWatcherPid(codexHome);
   return {
     background: (await readSettings(codexHome)).background,
-    pid: await runningWatcherPid(codexHome),
-    log: warmPaths(codexHome).log
+    pid,
+    log: warmPaths(codexHome).log,
+    startFailure: pid === null ? await readStartFailure(codexHome) : null
   };
 }

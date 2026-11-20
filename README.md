@@ -217,25 +217,29 @@ request failed is not sent another one for an hour. It logs to
 `~/.codex/log/cx-warm.log` (the state of every account on start, then only
 what changed),
 and `cx status` shows whether it runs. It stops with the machine, and any `cx`
-command starts it again until `cx warm stop`. `cx warm --watch` does the same in
-the terminal instead; only one of them runs at a time.
+command starts it again until `cx warm stop`; after it failed to start, they
+try again 10 minutes later, and `cx status` says why it failed. `cx warm
+--watch` does the same in the terminal instead; only one of them runs at a time.
 
 It works apart from the Codex you are using:
 
 - Each request runs in a private Codex home under `~/.codex/tmp/` holding a copy
   of the account's login, also for the account Codex is logged in to. It is
-  `codex exec --ephemeral` with the prompt `Reply with OK.`, without your
-  `config.toml`, rules, project, sessions or app-server daemon, and uses a
-  sliver of the quota (and starts the 5-hour window as well). It usually takes
-  under a minute per account, and is given up after 3.
+  `codex exec --ephemeral` with the prompt `Reply with OK.` at low reasoning
+  effort, without your `config.toml`, rules, project, sessions or app-server
+  daemon, and uses a sliver of the quota (and starts the 5-hour window as
+  well). It usually takes under a minute per account, and is given up after 3.
+  Whatever that Codex starts ends with it, and when `cx warm` is stopped.
 - `cx` holds its lock only for the moment it saves tokens, never while Codex
   runs, so `cx switch` and the other commands keep working.
 - Codex refreshes old tokens on the way. A refresh token is single-use, so `cx`
   saves the refreshed tokens back to the account's snapshot, and to
   `~/.codex/auth.json` while Codex is logged in to that account (never older
-  ones over newer). A running Codex rereads `auth.json` before it refreshes a
-  token or after one is rejected, so it picks them up. The private home is then
-  removed; one left behind by an interrupted run is recovered by the next.
+  ones over newer), within a second of Codex writing them rather than once it
+  is done. A running Codex rereads `auth.json` before it refreshes a token or
+  after one is rejected, so it picks them up. The private home is then
+  removed; one left behind by an interrupted run is recovered by the next, once
+  the Codex it started has ended.
 
 Which accounts are sent a request:
 
@@ -251,8 +255,10 @@ Which accounts are sent a request:
   use while one of its sessions (terminal or app) was written to in the last 10
   minutes; the background `cx warm` notices within a minute that you started.
 - An account whose saved sign-in expired can't report its quota, so it is sent
-  the request as well: it renews the sign-in. Accounts that are signed out or
-  have no saved login are only reported.
+  the request as well: it renews the sign-in. Not the account Codex is logged
+  in to: Codex renews that one itself when you use it, and both refreshing the
+  same token at once would sign it out. Accounts that are signed out or have no
+  saved login are only reported.
 
 `cx warm` without `start` makes one pass and exits with status 1 if a request
 failed, or went through but the window still shows as not started.

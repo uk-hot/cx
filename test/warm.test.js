@@ -16,6 +16,8 @@ import {
   nextWarmCheck,
   renderWarmChanges,
   renderWarmResults,
+  runCodexExec,
+  stopActiveExecs,
   warmAccounts,
   warmFailed
 } from "../src/warm-service.js";
@@ -199,7 +201,7 @@ test("an account another cx warm is warming is left to it", async (t) => {
   await fs.mkdir(inUse, { recursive: true });
   const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
   t.after(() => other.kill());
-  await fs.writeFile(path.join(inUse, "cx-owner.json"), JSON.stringify({ pid: other.pid }));
+  await fs.writeFile(path.join(inUse, "cx-owner.json"), JSON.stringify({ pid: other.pid, startedAt: new Date().toISOString() }));
   const usage = fakeUsage({ "access-one": { name: "one", body: windowBody({ weeklyIdle: true }) } });
 
   const results = await warmAccounts(codexHome, {
@@ -576,4 +578,198 @@ test("Codex counts as in use while a session was written in the last 10 minutes,
   db.prepare("INSERT INTO threads VALUES (?, ?, ?)").run("t1", resumed, Math.floor(now / 1000));
   db.close();
   assert.equal(await isCodexActive(codexHome, now), true);
+});
+
+test("an expired sign-in of the account Codex is logged in to is left to Codex", async (t) => {
+  const one = accountFor("one");
+  const expired = authFor("one", { accessToken: jwt({ exp: NOW - 60 }) });
+  const codexHome = await makeHome(t, { accounts: [one], live: expired, snapshots: { [one.account_key]: expired } });
+
+  const results = await warmAccounts(codexHome, {
+    fetchFn: async () => new Response("{}", { status: 401 }),
+    runExec: async () => assert.fail("no request expected")
+  });
+
+  assert.deepEqual(results.map(({ outcome, attempted }) => [outcome, attempted]), [["renews-on-use", false]]);
+  assert.equal(warmFailed(results), false);
+  assert.match(renderWarmResults(results), /Codex is logged in to it and renews it when you use it/);
+  assert.equal(nextWarmCheck(results, NOW * 1000), NOW * 1000 + 30 * 60 * 1000);
+});
+
+test("tokens Codex refreshes are saved while it still runs", async (t) => {
+  const one = accountFor("one");
+  const codexHome = await makeHome(t, {
+    accounts: [one],
+    live: authFor("one", { refreshToken: "live" }),
+    snapshots: { [one.account_key]: authFor("one") }
+  });
+  const usage = fakeUsage({ "access-one": { name: "one", body: windowBody({ weeklyIdle: true }), afterWarm: windowBody() } });
+  let savedWhileRunning = false;
+
+  await warmAccounts(codexHome, {
+    fetchFn: usage.fetchFn,
+    verifyDelayMs: 0,
+    runExec: async ({ codexHome: home }) => {
+      await fs.writeFile(path.join(home, "auth.json"), JSON.stringify(authFor("one", { refreshToken: "new", lastRefresh: "2026-11-19T00:00:00Z" })));
+      for (let waited = 0; waited < 5000 && !savedWhileRunning; waited += 100) {
+        const live = JSON.parse(await fs.readFile(path.join(codexHome, "auth.json"), "utf8"));
+        savedWhileRunning = live.tokens.refresh_token === "new"
+          && (await snapshotOf(codexHome, one.account_key)).tokens.refresh_token === "new";
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      usage.warmed.add("one");
+      return { ok: true, detail: null };
+    }
+  });
+
+  assert.ok(savedWhileRunning);
+});
+
+test("a warm-up home whose owner pid was recorded before the machine started is recovered", async (t) => {
+  const one = accountFor("one");
+  const codexHome = await makeHome(t, { accounts: [one], snapshots: { [one.account_key]: authFor("one") } });
+  const leftover = path.join(codexHome, "tmp", `cx-warm-${Buffer.from(one.account_key).toString("base64url")}`);
+  await fs.mkdir(leftover, { recursive: true });
+  await fs.writeFile(path.join(leftover, "auth.json"), JSON.stringify(authFor("one", { refreshToken: "rescued", lastRefresh: "2026-11-19T00:00:00Z" })));
+  // The pid now belongs to an unrelated process.
+  const unrelated = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore" });
+  t.after(() => unrelated.kill());
+  await fs.writeFile(path.join(leftover, "cx-owner.json"), JSON.stringify({ pid: unrelated.pid, startedAt: "2000-01-01T00:00:00Z" }));
+
+  await warmAccounts(codexHome, { fetchFn: async () => new Response("{}", { status: 500 }) });
+
+  assert.equal((await snapshotOf(codexHome, one.account_key)).tokens.refresh_token, "rescued");
+  await assert.rejects(fs.access(leftover), { code: "ENOENT" });
+});
+
+const posixOnly = { skip: process.platform === "win32" && "process groups are POSIX" };
+
+function spawnGroup() {
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], { stdio: "ignore", detached: true });
+  child.unref();
+  return child;
+}
+
+test("a Codex that outlives its cx keeps its warm-up home until it ends", posixOnly, async (t) => {
+  const one = accountFor("one");
+  const codexHome = await makeHome(t, { accounts: [one], snapshots: { [one.account_key]: authFor("one") } });
+  const warmDir = path.join(codexHome, "tmp", `cx-warm-${Buffer.from(one.account_key).toString("base64url")}`);
+  const usage = fakeUsage({ "access-one": { name: "one", body: windowBody({ weeklyIdle: true }) } });
+  const survivor = spawnGroup();
+  t.after(() => survivor.kill("SIGKILL"));
+
+  // A Codex that is still running when its request returns.
+  const first = await warmAccounts(codexHome, {
+    fetchFn: usage.fetchFn,
+    verifyDelayMs: 0,
+    runExec: async ({ codexHome: home, onSpawn }) => {
+      onSpawn(survivor.pid);
+      await fs.writeFile(path.join(home, "auth.json"), JSON.stringify(authFor("one", { refreshToken: "late", lastRefresh: "2026-11-19T00:00:00Z" })));
+      return { ok: false, detail: "codex timed out" };
+    }
+  });
+  assert.equal(first[0].outcome, "failed");
+  await fs.access(warmDir);
+  assert.equal(JSON.parse(await fs.readFile(path.join(warmDir, "cx-owner.json"), "utf8")).execPid, survivor.pid);
+
+  // Even with its cx gone, the home is in use while that Codex runs.
+  const { pid: deadPid } = spawnSync(process.execPath, ["-e", ""]);
+  const owner = JSON.parse(await fs.readFile(path.join(warmDir, "cx-owner.json"), "utf8"));
+  await fs.writeFile(path.join(warmDir, "cx-owner.json"), JSON.stringify({ ...owner, pid: deadPid }));
+  const busy = await warmAccounts(codexHome, { fetchFn: usage.fetchFn, runExec: async () => assert.fail("no request expected") });
+  assert.deepEqual(busy.map(({ outcome, attempted }) => [outcome, attempted]), [["failed", false]]);
+  await fs.access(warmDir);
+
+  survivor.kill("SIGKILL");
+  await waitFor(() => !isAlive(survivor.pid));
+  await warmAccounts(codexHome, { fetchFn: async () => new Response("{}", { status: 500 }) });
+  await assert.rejects(fs.access(warmDir), { code: "ENOENT" });
+  assert.equal((await snapshotOf(codexHome, one.account_key)).tokens.refresh_token, "late");
+});
+
+async function fakeCodex(t, script) {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "cx-fake-codex-"));
+  const saved = { PATH: process.env.PATH, CX_TEST_DIR: process.env.CX_TEST_DIR };
+  t.after(async () => {
+    process.env.PATH = saved.PATH;
+    if (saved.CX_TEST_DIR === undefined) {
+      delete process.env.CX_TEST_DIR;
+    } else {
+      process.env.CX_TEST_DIR = saved.CX_TEST_DIR;
+    }
+    await fs.rm(dir, { recursive: true, force: true });
+  });
+  await fs.writeFile(path.join(dir, "codex"), `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+  process.env.PATH = `${dir}${path.delimiter}${process.env.PATH}`;
+  process.env.CX_TEST_DIR = dir;
+  return dir;
+}
+
+const readPid = async (file) => {
+  for (let waited = 0; waited < 5000; waited += 50) {
+    const text = await fs.readFile(file, "utf8").catch(() => "");
+    if (text.trim()) {
+      return Number(text.trim());
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return assert.fail(`no pid in ${file}`);
+};
+
+test("codex exec runs at low effort, and what it leaves running is ended with it", posixOnly, async (t) => {
+  const dir = await fakeCodex(t, [
+    'echo "$@" > "$CX_TEST_DIR/args"',
+    'sleep 60 >/dev/null 2>&1 &',
+    'echo $! > "$CX_TEST_DIR/child"',
+    "echo '{\"type\":\"turn.completed\"}'"
+  ].join("\n"));
+
+  const result = await runCodexExec({ codexHome: dir, cwd: dir });
+
+  assert.deepEqual(result, { ok: true, detail: null });
+  assert.match(await fs.readFile(path.join(dir, "args"), "utf8"), /-c model_reasoning_effort=low/);
+  const straggler = await readPid(path.join(dir, "child"));
+  await waitFor(() => !isAlive(straggler));
+});
+
+test("a codex exec that times out or is stopped is ended with everything it started", posixOnly, async (t) => {
+  const dir = await fakeCodex(t, 'sleep 60 &\necho $! > "$CX_TEST_DIR/child"\nwait');
+
+  const timedOut = await runCodexExec({ codexHome: dir, cwd: dir, timeoutMs: 300 });
+  assert.deepEqual(timedOut, { ok: false, detail: "codex timed out" });
+  const first = await readPid(path.join(dir, "child"));
+  await waitFor(() => !isAlive(first));
+
+  await fs.rm(path.join(dir, "child"));
+  let spawned;
+  const running = runCodexExec({ codexHome: dir, cwd: dir, onSpawn: (pid) => { spawned = pid; } });
+  const second = await readPid(path.join(dir, "child"));
+  assert.ok(Number.isInteger(spawned));
+  stopActiveExecs();
+  assert.equal((await running).ok, false);
+  await waitFor(() => !isAlive(second) && !isAlive(spawned));
+});
+
+test("after the background cx warm failed to start, cx commands wait a while before trying again", { timeout: 30000 }, async (t) => {
+  const home = await fs.mkdtemp(path.join(os.tmpdir(), "cx-warm-revive-"));
+  t.after(async () => {
+    await cli(home, "warm", "stop").catch(() => {});
+    await fs.rm(home, { recursive: true, force: true });
+  });
+  const codexHome = path.join(home, ".codex");
+  await fs.mkdir(path.join(codexHome, "accounts"), { recursive: true });
+  await fs.mkdir(path.join(codexHome, "tmp"), { recursive: true });
+  await fs.writeFile(path.join(codexHome, "accounts", "cx-warm.json"), JSON.stringify({ background: true }));
+  const failedFile = path.join(codexHome, "tmp", "cx-warm.start-failed");
+  await fs.writeFile(failedFile, JSON.stringify({ at: new Date().toISOString(), error: "exited at once" }));
+
+  await cli(home, "list");
+  await assert.rejects(fs.access(path.join(codexHome, "tmp", "cx-warm.pid")));
+  assert.match((await cli(home, "status")).stdout, /Background warm: on but not running; it failed to start at .* \(exited at once\)/);
+
+  // Long enough ago: the next command tries again, and success clears it.
+  await fs.writeFile(failedFile, JSON.stringify({ at: new Date(Date.now() - 11 * 60 * 1000).toISOString(), error: "exited at once" }));
+  await cli(home, "list");
+  assert.ok(isAlive(await pidOf(home)));
+  await assert.rejects(fs.access(failedFile));
 });

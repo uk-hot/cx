@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import os from "node:os";
 import process from "node:process";
 import { createInterface } from "node:readline/promises";
 import { parseArgs } from "node:util";
@@ -33,7 +34,14 @@ import {
   stopBackgroundWarm
 } from "./warm-daemon.js";
 import { isCodexActive } from "./codex-activity.js";
-import { nextWarmCheck, renderWarmChanges, renderWarmResults, warmAccounts, warmFailed } from "./warm-service.js";
+import {
+  nextWarmCheck,
+  renderWarmChanges,
+  renderWarmResults,
+  stopActiveExecs,
+  warmAccounts,
+  warmFailed
+} from "./warm-service.js";
 
 /** @typedef {import("./registry.js").Account} Account */
 /** @typedef {import("./service.js").SyncResult} SyncResult */
@@ -330,10 +338,16 @@ const WARM_RETRY_COOLDOWN_MS = 60 * 60 * 1000;
 
 async function renderBackgroundWarm() {
   try {
-    const { pid, log } = await backgroundWarmStatus(codexHome);
-    return pid === null
-      ? "Background warm: off (cx warm start turns it on)"
-      : `Background warm: running (pid ${pid}), log: ${log}`;
+    const { background, pid, log, startFailure } = await backgroundWarmStatus(codexHome);
+    if (pid !== null) {
+      return `Background warm: running (pid ${pid}), log: ${log}`;
+    }
+    if (!background) {
+      return "Background warm: off (cx warm start turns it on)";
+    }
+    return startFailure
+      ? `Background warm: on but not running; it failed to start at ${localTime(startFailure.at)} (${startFailure.error}). cx warm start tries again`
+      : "Background warm: on but not running; the next cx command starts it";
   } catch (error) {
     return `Background warm: unknown (${errorMessage(error)})`;
   }
@@ -360,6 +374,15 @@ async function warmCommand(action, watch) {
     console.log(result.status === "stopped" ? `Stopped cx warm (pid ${result.pid}).` : "cx warm was not running.");
     return;
   }
+  // Codex runs in a process group of its own, which a Ctrl+C or a stop doesn't
+  // reach: end it before exiting, or it may refresh tokens after its warm-up
+  // home was recovered.
+  for (const signal of /** @type {const} */ (["SIGINT", "SIGTERM", "SIGHUP"])) {
+    process.once(signal, () => {
+      stopActiveExecs();
+      process.exit(watch ? 0 : 128 + (os.constants.signals[signal] ?? 0));
+    });
+  }
   if (!watch) {
     const results = await warmAccounts(codexHome, { codexActive: await codexActiveNow() });
     console.log(renderWarmResults(results));
@@ -372,9 +395,6 @@ async function warmCommand(action, watch) {
   const claim = await claimWatcher(codexHome);
   if (!claim.claimed) {
     throw new Error(`cx warm already runs (pid ${claim.pid}). Stop it first: cx warm stop`);
-  }
-  for (const signal of /** @type {const} */ (["SIGINT", "SIGTERM", "SIGHUP"])) {
-    process.once(signal, () => process.exit(0));
   }
   // An account whose request failed isn't sent another one for a while, so a
   // revoked login doesn't start Codex on every check.

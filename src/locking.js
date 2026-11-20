@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import { codexPaths } from "./constants.js";
@@ -42,6 +43,16 @@ export function isProcessRunning(pid) {
   } catch (error) {
     return /** @type {NodeJS.ErrnoException} */ (error)?.code === "EPERM";
   }
+}
+
+/**
+ * Whether a process that recorded `startedAt` started after the machine last
+ * did. A pid recorded before that may belong to anything now.
+ * @param {unknown} startedAt ISO time
+ */
+export function startedSinceBoot(startedAt) {
+  const bootedAt = Date.now() - os.uptime() * 1000;
+  return typeof startedAt === "string" && Date.parse(startedAt) > bootedAt;
 }
 
 /** @param {string} lockDir */
