@@ -78,6 +78,29 @@ export async function writeThreadOwners(codexHome, owners) {
 }
 
 /**
+ * Hands the threads of accounts that are going away to the one that replaces
+ * them. Callers hold the cx lock.
+ * @param {string} codexHome
+ * @param {Set<string>} fromKeys
+ * @param {string} toKey
+ * @returns {Promise<number>} how many threads moved
+ */
+export async function reassignThreadOwners(codexHome, fromKeys, toKey) {
+  const owners = await readThreadOwners(codexHome);
+  let moved = 0;
+  for (const owner of Object.values(owners.threads)) {
+    if (fromKeys.has(owner.account)) {
+      owner.account = toKey;
+      moved += 1;
+    }
+  }
+  if (moved > 0) {
+    await writeThreadOwners(codexHome, owners);
+  }
+  return moved;
+}
+
+/**
  * The time a rollout line starts a turn at, or null for any other line.
  * @param {Buffer} line
  */

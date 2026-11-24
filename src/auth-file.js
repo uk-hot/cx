@@ -109,6 +109,18 @@ export function creatorIdsOf(authText) {
 }
 
 /**
+ * Who a ChatGPT login is, whatever way it signed in: `${chatgpt user id}::
+ * ${account id}`, or null when the tokens don't say. The registry key's `sub`
+ * names the sign-in method instead (google-oauth2|… for Google, auth0|… for a
+ * password), so one person signing in two ways has two keys but one of these.
+ * @param {string | null} authText
+ */
+export function loginIdentityOf(authText) {
+  const ids = creatorIdsOf(authText);
+  return ids?.userId ? `${ids.userId}::${ids.accountId}` : null;
+}
+
+/**
  * Identifies a non-OAuth login (which has no account key) without storing the
  * API key itself in the registry.
  * @param {string} authText

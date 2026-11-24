@@ -241,6 +241,27 @@ test("signing in to the same account refreshes it without adding a duplicate", {
   assert.deepEqual(await ctx.readSnapshots(), [refreshed]);
 });
 
+test("signing in to the same person another way refreshes it without adding a duplicate", { skip }, async (t) => {
+  const ctx = await setup(t);
+  const signIn = (sub, token) => JSON.stringify({
+    auth_mode: "chatgpt",
+    tokens: {
+      account_id: "account-me",
+      id_token: jwt({ sub, email: "me@example.com", "https://api.openai.com/auth": { chatgpt_user_id: "user-me" } }),
+      refresh_token: token
+    }
+  });
+  await fs.writeFile(ctx.loginAuthPath, signIn("google-oauth2|1", "dead"));
+  await ctx.run(["add", "me"]);
+  await fs.writeFile(ctx.loginAuthPath, signIn("auth0|2", "fresh"));
+
+  const { stdout } = await ctx.run(["add"]);
+  assert.match(stdout, /^Refreshed already registered account: me@example\.com$/m);
+  const registry = await ctx.readRegistry();
+  assert.deepEqual(registry.accounts.map((account) => [account.account_key, account.alias]), [["auth0|2::account-me", "me"]]);
+  assert.deepEqual(await ctx.readSnapshots(), [signIn("auth0|2", "fresh")]);
+});
+
 test("closing the terminal stops Codex and restores the current account", { skip }, async (t) => {
   const ctx = await setup(t);
   await fs.writeFile(ctx.authPath, oauthAuth("old"));

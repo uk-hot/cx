@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { authDigest, parseAuthText } from "./auth-file.js";
+import { authDigest, loginIdentityOf, parseAuthText } from "./auth-file.js";
 import { mergeAccountConfigText, readCurrentProviderFromConfigText } from "./config-file.js";
 import { DEFAULT_PROVIDER, codexPaths } from "./constants.js";
 import { fileExists, fileModeOr, isNotFound, readTextIfExists, writeFileAtomically } from "./fs-utils.js";
@@ -16,7 +16,7 @@ import {
   snapshotPaths,
   writeRegistry
 } from "./registry.js";
-import { tryRecordSessionOwners } from "./session-owners.js";
+import { reassignThreadOwners, tryRecordSessionOwners } from "./session-owners.js";
 
 /** @typedef {import("./auth-file.js").AuthIdentity} AuthIdentity */
 /** @typedef {import("./registry.js").Account} Account */
@@ -67,6 +67,119 @@ export function lastRefreshMs(authText) {
   } catch {
     return null;
   }
+}
+
+/**
+ * One person signing in two ways (Google, then a password) gets two registry
+ * keys, because the key's `sub` names the sign-in method, yet it is one
+ * ChatGPT login. Folds each such group into one account: `preferredKey` when it
+ * is in the group, otherwise the one with the newest tokens. The others'
+ * threads, alias and activation move to it. Callers hold the cx lock, write the
+ * registry, then delete the folded accounts' snapshots (deleteSnapshots):
+ * threads move first, so an interrupted fold just runs again.
+ * @param {string} codexHome
+ * @param {Registry} registry changed in place
+ * @param {string | null} [preferredKey]
+ * @returns {Promise<Map<string, string>>} each folded account key → the key it went into
+ */
+async function foldDuplicateLogins(codexHome, registry, preferredKey = null) {
+  const paths = codexPaths(codexHome);
+  const liveText = await readTextIfExists(paths.auth).catch(() => null);
+  const liveKey = liveLoginOf(liveText, await readTextIfExists(paths.config).catch(() => null))?.accountKey ?? null;
+
+  /** @type {Map<string, { account: Account, refreshedAt: number }[]>} */
+  const groups = new Map();
+  for (const account of registry.accounts) {
+    const authText = await readTextIfExists(snapshotPaths(codexHome, account.account_key).auth).catch(() => null);
+    const identity = loginIdentityOf(authText);
+    if (!identity) {
+      continue;
+    }
+    // Codex refreshes the live login's tokens in auth.json, not in its snapshot.
+    const refreshes = [lastRefreshMs(authText), account.account_key === liveKey ? lastRefreshMs(liveText) : null];
+    const refreshedAt = Math.max(-Infinity, ...refreshes.filter((value) => value !== null));
+    groups.set(identity, [...groups.get(identity) ?? [], { account, refreshedAt }]);
+  }
+
+  /** @type {Map<string, string>} */
+  const folded = new Map();
+  for (const members of groups.values()) {
+    if (members.length < 2) {
+      continue;
+    }
+    /** @param {{ account: Account, refreshedAt: number }} member */
+    const rank = ({ account, refreshedAt }) => [account.account_key === preferredKey ? 1 : 0, refreshedAt, account.created_at ?? 0];
+    members.sort((a, b) => {
+      const [ra, rb] = [rank(a), rank(b)];
+      const index = ra.findIndex((value, i) => value !== rb[i]);
+      return index < 0 ? 0 : rb[index] - ra[index];
+    });
+    const [keep, ...rest] = members.map((member) => member.account);
+    const restKeys = new Set(rest.map((account) => account.account_key));
+
+    await reassignThreadOwners(codexHome, restKeys, keep.account_key);
+    keep.alias ||= rest.find((account) => account.alias)?.alias ?? "";
+    // Same login, so the same plan and quota.
+    for (const field of /** @type {const} */ (["email", "account_name", "plan", "last_usage", "last_usage_at", "last_local_rollout"])) {
+      if (keep[field] == null) {
+        Object.assign(keep, { [field]: rest.find((account) => account[field] != null)?.[field] ?? null });
+      }
+    }
+    const createdAt = [keep, ...rest].map((account) => account.created_at).filter(Number.isFinite);
+    const lastUsedAt = [keep, ...rest].map((account) => account.last_used_at).filter(Number.isFinite);
+    if (createdAt.length) {
+      keep.created_at = Math.min(...createdAt);
+    }
+    if (lastUsedAt.length) {
+      keep.last_used_at = Math.max(...lastUsedAt);
+    }
+    if (registry.active_account_key !== null && restKeys.has(registry.active_account_key)) {
+      registry.active_account_key = keep.account_key;
+    }
+    registry.accounts = registry.accounts.filter((account) => !restKeys.has(account.account_key));
+    for (const key of restKeys) {
+      folded.set(key, keep.account_key);
+    }
+  }
+  return folded;
+}
+
+/**
+ * @param {string} codexHome
+ * @param {Iterable<string>} accountKeys
+ */
+async function deleteSnapshots(codexHome, accountKeys) {
+  for (const accountKey of accountKeys) {
+    const snapshot = snapshotPaths(codexHome, accountKey);
+    await fs.rm(snapshot.auth, { force: true });
+    await fs.rm(snapshot.config, { force: true });
+  }
+}
+
+/**
+ * The registered account a ChatGPT login belongs to: the one with its key, or
+ * the same person signed in another way.
+ * @param {string} codexHome
+ * @param {Account[]} accounts
+ * @param {string | null} authText
+ */
+async function findRegisteredLogin(codexHome, accounts, authText) {
+  const parsed = parseAuthText(authText);
+  if (!parsed) {
+    return null;
+  }
+  const byKey = accounts.find((account) => account.account_key === parsed.accountKey);
+  const identity = loginIdentityOf(authText);
+  if (byKey || !identity) {
+    return byKey ?? null;
+  }
+  for (const account of accounts) {
+    const snapshotText = await readTextIfExists(snapshotPaths(codexHome, account.account_key).auth).catch(() => null);
+    if (loginIdentityOf(snapshotText) === identity) {
+      return account;
+    }
+  }
+  return null;
 }
 
 /**
@@ -143,8 +256,10 @@ async function persistCurrentConfigSnapshot(codexHome, registry) {
 /**
  * Brings the registry in line with the login in auth.json: Codex may have been
  * signed in to another registered account, or refreshed its tokens, since the
- * last cx run. Opportunistic: skipped when another cx run holds the lock. With
- * a third-party provider, auth.json does not say which account is in use.
+ * last cx run. Also folds accounts registered twice for one person signed in
+ * two ways (foldDuplicateLogins). Opportunistic: skipped when another cx run
+ * holds the lock. With a third-party provider, auth.json does not say which
+ * account is in use.
  * @param {string} codexHome
  */
 export async function syncActiveAccountFromCurrentAuth(codexHome) {
@@ -153,9 +268,6 @@ export async function syncActiveAccountFromCurrentAuth(codexHome) {
   try {
     parsed = liveLoginOf(await readTextIfExists(paths.auth), await readTextIfExists(paths.config));
   } catch {
-    return false;
-  }
-  if (!parsed) {
     return false;
   }
 
@@ -170,10 +282,35 @@ export async function syncActiveAccountFromCurrentAuth(codexHome) {
   }
 
   try {
-    const registry = await readRegistry(codexHome);
-    const match = registry.accounts.find((account) => account.account_key === parsed.accountKey);
-    if (!match) {
+    // Only a live login was ever synced here: folding alone must not fail the
+    // command over an unreadable registry or thread owner file.
+    const readRegistryOrNull = () => readRegistry(codexHome).catch((error) => {
+      if (parsed) {
+        throw error;
+      }
+      return null;
+    });
+    let registry = await readRegistryOrNull();
+    /** @type {Map<string, string>} */
+    let folded = new Map();
+    try {
+      folded = registry ? await foldDuplicateLogins(codexHome, registry) : folded;
+    } catch {
+      // Nothing changed on disk; the next run tries again.
+      registry = await readRegistryOrNull();
+    }
+    if (!registry) {
       return false;
+    }
+    const finalRegistry = registry;
+    const save = async () => {
+      await writeRegistry(codexHome, finalRegistry);
+      await deleteSnapshots(codexHome, folded.keys());
+      return true;
+    };
+    const match = parsed && registry.accounts.find((account) => account.account_key === parsed.accountKey);
+    if (!parsed || !match) {
+      return folded.size > 0 ? save() : false;
     }
 
     let changed = false;
@@ -199,12 +336,10 @@ export async function syncActiveAccountFromCurrentAuth(codexHome) {
       }
     }
 
-    if (!changed) {
-      return false;
+    if (changed) {
+      match.last_used_at = nowSeconds();
     }
-    match.last_used_at = nowSeconds();
-    await writeRegistry(codexHome, registry);
-    return true;
+    return changed || folded.size > 0 ? save() : false;
   } finally {
     await releaseLock();
   }
@@ -245,16 +380,21 @@ export async function addAccount(codexHome, alias) {
     throw new Error(`Cannot auto-detect account identity for provider "${provider ?? DEFAULT_PROVIDER}". Provide an alias: cx add <alias>`);
   }
 
-  return withLock(codexHome, "add", () => registerAccount(codexHome, { parsed, alias, provider, authText, configText }));
+  // Adding is deliberate: this login replaces the same person's other sign-in.
+  return withLock(codexHome, "add", () => registerAccount(codexHome, { parsed, alias, provider, authText, configText }, { replaces: true }));
 }
 
 /**
- * Writes the snapshots and the registry entry. Callers must hold the cx lock.
+ * Writes the snapshots and the registry entry. When the same person is
+ * registered under another sign-in, one account remains: this login with
+ * `replaces`, otherwise the one with the newer tokens (foldDuplicateLogins).
+ * Callers must hold the cx lock.
  * @param {string} codexHome
  * @param {{ parsed: AuthIdentity | null, alias?: string, provider: string | null, authText: string | null, configText: string | null }} login
+ * @param {{ replaces?: boolean }} [options]
  * @returns {Promise<AccountSummary>}
  */
-async function registerAccount(codexHome, { parsed, alias, provider, authText, configText }) {
+async function registerAccount(codexHome, { parsed, alias, provider, authText, configText }, { replaces = false } = {}) {
   const accountKey = parsed ? parsed.accountKey : `manual::${alias}`;
 
   await ensureAccountsDir(codexHome);
@@ -303,10 +443,20 @@ async function registerAccount(codexHome, { parsed, alias, provider, authText, c
     registry.accounts.push(accountEntry);
   }
 
-  await markActive(codexHome, registry, accountKey, parsed);
-  await writeRegistry(codexHome, registry);
+  // Before the activation, so that it credits the recent threads to the
+  // account that remains.
+  const folded = await foldDuplicateLogins(codexHome, registry, replaces ? accountKey : null);
+  const keptKey = folded.get(accountKey) ?? accountKey;
+  const kept = /** @type {Account} */ (registry.accounts.find((account) => account.account_key === keptKey));
+  if (alias !== undefined) {
+    kept.alias = alias;
+  }
 
-  return { accountKey, email: accountEntry.email, alias: accountEntry.alias, provider };
+  await markActive(codexHome, registry, keptKey, parsed);
+  await writeRegistry(codexHome, registry);
+  await deleteSnapshots(codexHome, folded.keys());
+
+  return { accountKey: keptKey, email: kept.email, alias: kept.alias, provider: kept.provider };
 }
 
 /**
@@ -414,9 +564,7 @@ export async function addAccountWithLogin(codexHome, alias, { runCodex, onCurren
     throw runError ?? new Error("No login was completed, so no account was added.");
   }
 
-  const parsed = parseAuthText(await readTextIfExists(authPath));
-  const accounts = await listAccounts(codexHome);
-  const alreadyRegistered = accounts.some((account) => account.account_key === parsed?.accountKey);
+  const alreadyRegistered = await findRegisteredLogin(codexHome, await listAccounts(codexHome), await readTextIfExists(authPath)) !== null;
   return { ...await addAccount(codexHome, alias), alreadyRegistered };
 }
 
