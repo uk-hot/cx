@@ -67,14 +67,15 @@ are still listed:
 - `sign-in expired`: its saved access token has expired. `cx status` never
   refreshes tokens, because a refresh token is single-use and refreshing one here
   could sign out a running Codex. `cx switch` to the account and use Codex to
-  renew it. If Codex asks you to sign in instead, its login is gone: sign in to
-  it again with `cx add` (see [Signing in again](#signing-in-again)).
+  renew it. If Codex says its token could not be refreshed instead, its login is
+  gone: run `codex logout` and sign in to Codex again (see
+  [Signing in again](#signing-in-again)).
 - `signed out`: its access token was rejected before it expired, so the login
   was revoked — by `codex logout`, by signing in to the account somewhere that
-  replaced this login, or by OpenAI. Codex usually can't renew it; sign in to
-  it again with `cx add`.
+  replaced this login, or by OpenAI. Codex usually can't renew it; `cx switch`
+  to it and sign in to Codex again.
 - `no saved login`: its snapshot is missing, malformed or belongs to another
-  account. Sign in to it again with `cx add`.
+  account. `cx switch` to it and sign in to Codex again.
 - `timed out`, `unreachable`, `HTTP <code>`: the usage request failed.
 - `unexpected response`: the usage endpoint answered in a format `cx` doesn't
   know.
@@ -138,27 +139,39 @@ key doesn't change the login, so it leaves the daemon alone.
 
 #### Signing in again
 
-An account whose login expired or was revoked — `cx status` shows `sign-in
-expired` or `signed out`, or Codex says its access token could not be refreshed
-and asks you to sign in — doesn't need to be removed and added back. Run
-`cx add` and sign in to that same account: its saved login is replaced, and its
-alias and registration are kept.
+An account whose login was revoked — `cx status` shows `signed out` — doesn't
+need to be removed and added back. `cx switch` to it: `cx` sees that its saved
+login is dead and leaves Codex signed out instead of restoring it. Open Codex,
+sign in as that account, and `cx` saves the new login over the dead one, keeping
+the alias and registration: within a minute while [`cx warm`](#cx-warm-startstop--watch)
+runs in the background, otherwise at the next `cx` command (and in any case
+before `cx switch` replaces it).
 
 ```bash
-cx add            # sign in as the account that expired
+cx switch me@example.com   # signed out: Codex is left signed out
+codex                      # sign in as me@example.com
 ```
 
-If the browser picks another account that is already signed in, that account is
-added (or refreshed) instead; sign in to the right one in a private window. A
-login whose access token merely expired can usually be renewed without signing
-in: `cx switch` to it and use Codex.
+A login whose access token merely expired (`sign-in expired`) can usually be
+renewed without signing in: `cx switch` to it and use Codex. If Codex says the
+token could not be refreshed, run `codex logout`, then sign in to Codex again;
+`cx` saves that login the same way.
+
+Signing in with another method than before (Google instead of a password, say)
+gives the login another key, but `cx` knows it is the same ChatGPT user and
+workspace and keeps one account. If the browser picks another account that is
+already signed in, that account is registered instead; sign in to the right one
+in a private window. `cx add` also still works for signing in again.
 
 ### `cx switch <email|alias>`
 
 Restores a registered account's `auth.json` and its provider/model settings from
 the saved `config.toml`, then synchronizes the `model_provider` metadata of all
 rollout files and SQLite rows to the switched account's provider. If the account
-can't be identified uniquely, you'll be prompted to choose (in a TTY).
+can't be identified uniquely, you'll be prompted to choose (in a TTY). An
+account whose saved login is signed out gets no `auth.json`, so Codex asks you
+to sign in (see [Signing in again](#signing-in-again)); finding that out takes
+one usage request when its access token hasn't expired yet.
 
 Codex 0.168+ records which ChatGPT account created a session
 (`account_scoped`, `creator_user_id` and `creator_account_id` in the rollout's
@@ -443,6 +456,19 @@ after closing Codex to sync them.
 ## Changelog
 
 ### Unreleased
+
+- Signing in again no longer needs `cx add`: `cx switch` to a signed-out
+  account (its access token rejected before it expired, or no usable saved
+  login) leaves Codex signed out instead of restoring the dead tokens, which
+  Codex can't refresh. Any `cx` command, and the background `cx warm` within a
+  minute, saves the login Codex then signs in to, and saves tokens Codex
+  refreshed into the active account's snapshot. `cx status` and `cx warm` point
+  to this instead of `cx add`.
+- One person signing in two ways (Google and a password) no longer ends up
+  registered twice: the registry key's `sub` names the sign-in method, so `cx`
+  now also compares the ChatGPT user id and workspace in the tokens. `cx add`
+  replaces the other sign-in, and existing duplicates are folded into the one
+  with the newest tokens, keeping its alias, usage and sessions.
 
 - `cx switch` keeps the sessions of the previous account visible even when
   Codex had them open: the rollout header is rewritten in place, padded to its

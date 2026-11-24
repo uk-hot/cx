@@ -199,10 +199,11 @@ export async function runSync({ codexHome, provider }) {
 /**
  * Switches the login to a registered account and syncs the sessions to its
  * provider. Snapshots auth.json, config.toml and the accounts directory first,
- * and puts them back if either step fails.
- * @param {{ codexHome: string, identifier: string | undefined, useAccountFn?: typeof useAccount }} options
+ * and puts them back if either step fails. `signIn`: the account's saved login
+ * is dead, so Codex is left signed out to sign in again (see useAccount).
+ * @param {{ codexHome: string, identifier: string | undefined, signIn?: boolean, useAccountFn?: typeof useAccount }} options
  */
-export async function runSwitch({ codexHome, identifier, useAccountFn = useAccount }) {
+export async function runSwitch({ codexHome, identifier, signIn = false, useAccountFn = useAccount }) {
   if (!identifier) {
     throw new Error("Missing account identifier. Usage: cx switch <email|alias>");
   }
@@ -216,7 +217,7 @@ export async function runSwitch({ codexHome, identifier, useAccountFn = useAccou
     const accounts = await snapshotDirectory(paths.accounts);
 
     try {
-      const switchedAccount = await useAccountFn(codexHome, identifier);
+      const switchedAccount = await useAccountFn(codexHome, identifier, { signIn });
       const { provider } = await readCurrentProvider(codexHome);
       return { ...await runSyncLocked({ codexHome, provider }), switchedAccount };
     } catch (error) {

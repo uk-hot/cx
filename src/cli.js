@@ -14,8 +14,8 @@ import {
 } from "./accounts.js";
 import { restartCodexDaemon } from "./codex-daemon.js";
 import { runCodexForLogin } from "./codex-login.js";
-import { defaultCodexHome } from "./constants.js";
-import { errorMessage } from "./fs-utils.js";
+import { codexPaths, defaultCodexHome } from "./constants.js";
+import { errorMessage, readTextIfExists } from "./fs-utils.js";
 import {
   accountDisplayName,
   findAccountsByIdentifier,
@@ -34,7 +34,7 @@ import {
 } from "./session-manager.js";
 import { getStatus, renderStatus, runSwitch, runSync } from "./service.js";
 import { buildTable, shellArgument } from "./terminal-ui.js";
-import { renderAccountUsage } from "./usage-service.js";
+import { deadSavedLogin, renderAccountUsage } from "./usage-service.js";
 import {
   backgroundWarmStatus,
   claimWatcher,
@@ -76,13 +76,13 @@ const COMMANDS = {
   },
   switch: {
     usage: "cx switch <email|alias>",
-    summary: ["Switch Codex to a registered account"],
+    summary: ["Switch Codex to a registered account; a signed-out one", "is left signed out for Codex to sign in, and cx saves it"],
     maxArgs: 1,
     run: ([identifier]) => switchAccount(identifier)
   },
   add: {
     usage: "cx add [alias]",
-    summary: ["Sign in to a new account, or again to a registered", "one whose login expired or was signed out"],
+    summary: ["Sign in to a new account (or again to a registered one)"],
     maxArgs: 1,
     run: ([alias]) => addAccountCommand(alias)
   },
@@ -294,16 +294,36 @@ async function printStatus() {
 async function switchAccount(identifier) {
   await syncActiveAccountFromCurrentAuth(codexHome);
   const resolved = await resolveAccountIdentifier(identifier, "switch");
-  const result = await runSwitch({ codexHome, identifier: resolved });
+  const dead = await deadLoginOf(resolved);
+  const result = await runSwitch({ codexHome, identifier: resolved, signIn: dead !== null });
   const account = result.switchedAccount;
-  console.log(`Switched account: ${account.email || account.alias || resolved}${account.provider ? ` [${account.provider}]` : ""}`);
+  const label = account.email || account.alias || resolved;
+  console.log(`Switched account: ${label}${account.provider ? ` [${account.provider}]` : ""}`);
   console.log(summarizeSync(result, "Synchronized"));
+  if (dead) {
+    const { pid } = await backgroundWarmStatus(codexHome).catch(() => ({ pid: null }));
+    console.log(`Its saved login is ${dead}, so Codex was left signed out. Open Codex and sign in as ${label}: cx saves the new login ${pid !== null ? "within a minute" : "the next time cx runs"}.`);
+  }
   if (await restartDaemonForNewLogin()) {
     await resyncAfterDaemonRestart(result);
   } else if (result.liveRolloutFiles.length) {
     // No restart closed them: a Codex outside the daemon (or a daemon that
     // didn't restart) may tag them again with the previous account.
     console.log(`Updated ${result.liveRolloutFiles.length} session(s) Codex has open. If one is hidden from this account after Codex closes it, run cx switch ${account.alias || account.email || resolved} again.`);
+  }
+}
+
+/**
+ * Why the saved login of the account a switch goes to can't be used, or null
+ * when it may work or that can't be told (the usage request failed, say).
+ * @param {string | undefined} identifier
+ */
+async function deadLoginOf(identifier) {
+  try {
+    const account = findSingleAccount(await listAccounts(codexHome), identifier ?? "");
+    return await deadSavedLogin(codexHome, account.account_key);
+  } catch {
+    return null;
   }
 }
 
@@ -439,7 +459,20 @@ async function warmCommand(action, watch) {
   const failedAt = new Map();
   /** @type {Map<string, string>} */
   let lastState = new Map();
+  // A login Codex signed in to (after cx switch to a signed-out account, say)
+  // or tokens it refreshed are saved within a minute, not at the next cx run.
+  let lastAuthText = /** @type {string | null | undefined} */ (undefined);
+  const saveChangedLogin = async () => {
+    const authText = await readTextIfExists(codexPaths(codexHome).auth).catch(() => null);
+    if (authText !== null && authText !== lastAuthText) {
+      lastAuthText = authText;
+      await syncActiveAccountFromCurrentAuth(codexHome).catch((error) => {
+        console.warn(`[${localTime(Date.now())}] Could not save the current login: ${errorMessage(error)}`);
+      });
+    }
+  };
   for (;;) {
+    await saveChangedLogin();
     let next;
     // While Codex is in use, idle 5-hour windows are started too.
     const codexActive = await codexActiveNow();
@@ -467,7 +500,10 @@ async function warmCommand(action, watch) {
     }
     console.log(`Next check: ${localTime(next)}${codexActive ? "" : ", or as soon as Codex is used"}`);
     // Starting to use Codex is a reason to check at once, for the 5-hour windows.
-    await sleepUntil(next, async () => !codexActive && await codexActiveNow());
+    await sleepUntil(next, async () => {
+      await saveChangedLogin();
+      return !codexActive && await codexActiveNow();
+    });
   }
 }
 

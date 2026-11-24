@@ -375,7 +375,7 @@ test("accounts that can't be read are reported without a request", async (t) => 
   });
 
   assert.deepEqual(results.map(({ outcome, detail }) => [outcome, detail]), [["error", "signed out"], ["error", "no saved login"]]);
-  assert.match(renderWarmResults(results), /signed out; sign in again with cx add/);
+  assert.match(renderWarmResults(results), /signed out; cx switch to it and sign in to Codex again/);
   assert.equal(nextWarmCheck(results, NOW * 1000), NOW * 1000 + 30 * 60 * 1000);
 });
 

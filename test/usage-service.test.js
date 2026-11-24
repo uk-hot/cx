@@ -329,10 +329,10 @@ test("accounts that need a new sign-in get the command that fixes them", () => {
   ]);
 
   assert.match(output, /^To sign in again:$/m);
-  assert.match(output, /^ {2}live@example\.com: use Codex to renew it\. If Codex asks you to sign in, run cx add, then sign in as live@example\.com\.$/m);
-  assert.match(output, /^ {2}idle@example\.com: cx switch idle@example\.com and use Codex to renew it\. If Codex asks/m);
-  assert.match(output, /^ {2}my work: run cx add, then sign in as my work\.$/m);
-  assert.match(output, /^ {2}lost@example\.com: run cx add, then sign in as lost@example\.com\.$/m);
+  assert.match(output, /^ {2}live@example\.com: use Codex to renew it\. If Codex says the token could not be refreshed, run codex logout, then sign in to Codex as live@example\.com\.$/m);
+  assert.match(output, /^ {2}idle@example\.com: cx switch idle@example\.com and use Codex to renew it\. If Codex says/m);
+  assert.match(output, /^ {2}my work: run cx switch 'my work', then sign in to Codex as my work\.$/m);
+  assert.match(output, /^ {2}lost@example\.com: run cx switch lost@example\.com, then sign in to Codex as lost@example\.com\.$/m);
   assert.doesNotMatch(output, /slow@example\.com:/);
   assert.match(renderUsage([{ label: "my work", active: false, error: "sign-in expired" }]), /cx switch 'my work' and/);
   assert.doesNotMatch(renderUsage([{ label: "ok@example.com", active: false, plan: "team" }]), /sign in again/);

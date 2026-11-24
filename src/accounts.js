@@ -11,7 +11,6 @@ import {
   accountDisplayName,
   ensureAccountsDir,
   findSingleAccount,
-  listAccounts,
   readRegistry,
   snapshotPaths,
   writeRegistry
@@ -157,29 +156,20 @@ async function deleteSnapshots(codexHome, accountKeys) {
 }
 
 /**
- * The registered account a ChatGPT login belongs to: the one with its key, or
- * the same person signed in another way.
+ * The registered account keys, and who each ChatGPT login among them is
+ * (loginIdentityOf): a login matching either is a registered account.
  * @param {string} codexHome
- * @param {Account[]} accounts
- * @param {string | null} authText
  */
-async function findRegisteredLogin(codexHome, accounts, authText) {
-  const parsed = parseAuthText(authText);
-  if (!parsed) {
-    return null;
-  }
-  const byKey = accounts.find((account) => account.account_key === parsed.accountKey);
-  const identity = loginIdentityOf(authText);
-  if (byKey || !identity) {
-    return byKey ?? null;
-  }
+async function registeredLogins(codexHome) {
+  const { accounts } = await readRegistry(codexHome);
+  const identities = new Set();
   for (const account of accounts) {
-    const snapshotText = await readTextIfExists(snapshotPaths(codexHome, account.account_key).auth).catch(() => null);
-    if (loginIdentityOf(snapshotText) === identity) {
-      return account;
+    const identity = loginIdentityOf(await readTextIfExists(snapshotPaths(codexHome, account.account_key).auth).catch(() => null));
+    if (identity) {
+      identities.add(identity);
     }
   }
-  return null;
+  return { keys: new Set(accounts.map((account) => account.account_key)), identities };
 }
 
 /**
@@ -214,9 +204,10 @@ async function persistCurrentOAuthSnapshot(codexHome, registry) {
     return false;
   }
   const snapshotPath = snapshotPaths(codexHome, parsed.accountKey).auth;
+  const snapshotText = await readTextIfExists(snapshotPath).catch(() => null);
   const liveRefresh = lastRefreshMs(authText);
-  const snapshotRefresh = lastRefreshMs(await readTextIfExists(snapshotPath).catch(() => null));
-  if (liveRefresh !== null && snapshotRefresh !== null && snapshotRefresh > liveRefresh) {
+  const snapshotRefresh = lastRefreshMs(snapshotText);
+  if (snapshotText === authText || (liveRefresh !== null && snapshotRefresh !== null && snapshotRefresh > liveRefresh)) {
     return false;
   }
   await writeFileAtomically(snapshotPath, authText);
@@ -255,8 +246,10 @@ async function persistCurrentConfigSnapshot(codexHome, registry) {
 
 /**
  * Brings the registry in line with the login in auth.json: Codex may have been
- * signed in to another registered account, or refreshed its tokens, since the
- * last cx run. Also folds accounts registered twice for one person signed in
+ * signed in to another account, or refreshed its tokens, since the last cx run.
+ * Saves that login: a new one is registered (Codex signing in on its own after
+ * `cx switch` to a signed-out account, say), a registered one's snapshot gets
+ * its newer tokens. Also folds accounts registered twice for one person signed in
  * two ways (foldDuplicateLogins). Opportunistic: skipped when another cx run
  * holds the lock. With a third-party provider, auth.json does not say which
  * account is in use.
@@ -308,9 +301,15 @@ export async function syncActiveAccountFromCurrentAuth(codexHome) {
       await deleteSnapshots(codexHome, folded.keys());
       return true;
     };
-    const match = parsed && registry.accounts.find((account) => account.account_key === parsed.accountKey);
-    if (!parsed || !match) {
+    if (!parsed) {
       return folded.size > 0 ? save() : false;
+    }
+    const match = registry.accounts.find((account) => account.account_key === parsed.accountKey);
+    if (!match) {
+      if (folded.size > 0) {
+        await save();
+      }
+      return await registerLiveLogin(codexHome) || folded.size > 0;
     }
 
     let changed = false;
@@ -339,7 +338,8 @@ export async function syncActiveAccountFromCurrentAuth(codexHome) {
     if (changed) {
       match.last_used_at = nowSeconds();
     }
-    return changed || folded.size > 0 ? save() : false;
+    const savedTokens = await persistCurrentOAuthSnapshot(codexHome, registry);
+    return changed || folded.size > 0 ? save() : savedTokens;
   } finally {
     await releaseLock();
   }
@@ -546,6 +546,9 @@ export async function addAccountWithLogin(codexHome, alias, { runCodex, onCurren
     await tryRecordSessionOwners(codexHome, await readRegistry(codexHome), { liveLogin: outgoingLogin });
   });
 
+  // What was registered before the sign-in: a background cx may save the new
+  // login before this add does.
+  const known = await registeredLogins(codexHome);
   await fs.rm(authPath, { force: true });
 
   // Codex stays open after signing in, so its exit code says nothing about the
@@ -564,15 +567,20 @@ export async function addAccountWithLogin(codexHome, alias, { runCodex, onCurren
     throw runError ?? new Error("No login was completed, so no account was added.");
   }
 
-  const alreadyRegistered = await findRegisteredLogin(codexHome, await listAccounts(codexHome), await readTextIfExists(authPath)) !== null;
+  const newAuthText = await readTextIfExists(authPath);
+  const newIdentity = loginIdentityOf(newAuthText);
+  const alreadyRegistered = known.keys.has(parseAuthText(newAuthText)?.accountKey ?? "")
+    || (newIdentity !== null && known.identities.has(newIdentity));
   return { ...await addAccount(codexHome, alias), alreadyRegistered };
 }
 
 /**
  * A login that never reached the registry, such as one from an interrupted
- * `cx add`, has no snapshot: replacing auth.json would lose it. A login removed
- * with `cx remove` is left out.
+ * `cx add` or one Codex signed in to on its own, has no snapshot: replacing
+ * auth.json would lose it. A login removed with `cx remove` is left out.
+ * Callers hold the cx lock.
  * @param {string} codexHome
+ * @returns {Promise<boolean>} whether it was registered
  */
 async function registerLiveLogin(codexHome) {
   const paths = codexPaths(codexHome);
@@ -580,25 +588,32 @@ async function registerLiveLogin(codexHome) {
   const configText = await readTextIfExists(paths.config);
   const parsed = liveLoginOf(authText, configText);
   if (!parsed) {
-    return;
+    return false;
   }
 
   const { accounts, removed_account_key: removedAccountKey } = await readRegistry(codexHome);
-  if (parsed.accountKey !== removedAccountKey
-    && !accounts.some((account) => account.account_key === parsed.accountKey)) {
-    await registerAccount(codexHome, { parsed, provider: providerOf(configText), authText, configText });
+  if (parsed.accountKey === removedAccountKey || accounts.some((account) => account.account_key === parsed.accountKey)) {
+    return false;
   }
+  await registerAccount(codexHome, { parsed, provider: providerOf(configText), authText, configText });
+  return true;
 }
 
 /**
  * Makes a registered account the live one: its auth.json, and its provider and
  * model settings merged into the live config.toml. Callers must hold the cx
  * lock (runSwitch does).
+ *
+ * With `signIn`, its saved login is known to be dead: auth.json is removed
+ * instead, so that Codex starts its own sign-in rather than failing to refresh
+ * the dead tokens, and the next cx run saves the new login
+ * (syncActiveAccountFromCurrentAuth). The snapshot is kept.
  * @param {string} codexHome
  * @param {string} identifier
+ * @param {{ signIn?: boolean }} [options]
  * @returns {Promise<AccountSummary>}
  */
-export async function useAccount(codexHome, identifier) {
+export async function useAccount(codexHome, identifier, { signIn = false } = {}) {
   if (!identifier) {
     throw new Error("Missing account identifier. Provide an email, alias, or account key.");
   }
@@ -627,7 +642,7 @@ export async function useAccount(codexHome, identifier) {
   await persistCurrentOAuthSnapshot(codexHome, registry);
   await persistCurrentConfigSnapshot(codexHome, registry);
 
-  if (hasAuthSnapshot) {
+  if (hasAuthSnapshot && !signIn) {
     await writeFileAtomically(paths.auth, await fs.readFile(snapshot.auth, "utf8"));
   } else {
     await fs.rm(paths.auth, { force: true });

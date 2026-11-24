@@ -665,7 +665,7 @@ function describe(result, nowSeconds) {
       return "no weekly limit";
     case "error":
       return result.detail === SIGNED_OUT || result.detail === NO_SAVED_LOGIN
-        ? `${result.detail}; sign in again with cx add`
+        ? `${result.detail}; cx switch to it and sign in to Codex again`
         : String(result.detail);
   }
 }

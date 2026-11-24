@@ -337,20 +337,47 @@ function quotaColor(cell) {
 }
 
 // What to run for an account that can't be read because of its sign-in. `cx
-// add` signing in to a registered account replaces its saved login.
+// switch` to a signed-out account leaves Codex signed out, and cx saves the
+// login Codex then signs in to.
 /** @param {UsageRow} row */
 function signInHint(row) {
-  const signInAgain = `cx add, then sign in as ${row.label}`;
+  const signInAgain = `cx switch ${shellArgument(row.label)}, then sign in to Codex as ${row.label}`;
   if (row.error === SIGN_IN_EXPIRED) {
     const renew = row.active
       ? "use Codex to renew it"
       : `cx switch ${shellArgument(row.label)} and use Codex to renew it`;
-    return `${row.label}: ${renew}. If Codex asks you to sign in, run ${signInAgain}.`;
+    return `${row.label}: ${renew}. If Codex says the token could not be refreshed, run codex logout, then sign in to Codex as ${row.label}.`;
   }
   if (row.error === SIGNED_OUT || row.error === NO_SAVED_LOGIN) {
     return `${row.label}: run ${signInAgain}.`;
   }
   return null;
+}
+
+/**
+ * Why an account's saved login can't be used at all, or null when it may
+ * still work: `no saved login`, or `signed out` (its access token rejected
+ * before it expired). An expired token proves nothing, Codex may renew it, so
+ * it isn't sent; nor is anything for a third-party or API-key account.
+ * @param {string} codexHome
+ * @param {string} accountKey
+ * @param {{ fetchFn?: FetchFn, now?: number }} [options]
+ * @returns {Promise<typeof SIGNED_OUT | typeof NO_SAVED_LOGIN | null>}
+ */
+export async function deadSavedLogin(codexHome, accountKey, { fetchFn, now = Date.now() } = {}) {
+  const account = (await readRegistry(codexHome)).accounts.find((entry) => entry.account_key === accountKey);
+  if (!account || !isOfficialAccount(account)) {
+    return null;
+  }
+  const credentials = credentialsFor(account, await readAuthData(snapshotPaths(codexHome, accountKey).auth));
+  if (!credentials) {
+    return NO_SAVED_LOGIN;
+  }
+  if (credentials.expiresAt === null || credentials.expiresAt <= Math.floor(now / 1000)) {
+    return null;
+  }
+  const [row] = await getAccountUsage(codexHome, { fetchFn, now, accountKeys: [accountKey] });
+  return row?.error === SIGNED_OUT ? SIGNED_OUT : null;
 }
 
 function usageTitle() {
